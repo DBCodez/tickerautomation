@@ -1,0 +1,31 @@
+{
+    "pinned_tab_index": 6,
+    "hotkey": "<alt>+d",
+    "ti_settle_guard_ms": 400,
+    "bookmap_window_title": "Bookmap",
+    "bookmap_focus_delay_ms": 220,
+    "bookmap_dialog_delay_ms": 280,
+    "bookmap_use_symbol_click": false,
+    "bookmap_symbol_rel_x": 0,
+    "bookmap_symbol_rel_y": 0,
+    "bookmap_use_subscribe_click": false,
+    "bookmap_subscribe_rel_x": 0,
+    "bookmap_subscribe_rel_y": 0,
+    "step_transition_delay_ms": 250,
+    "browser_executables": [
+        "firefox.exe",
+        "chrome.exe",
+        "msedge.exe",
+        "brave.exe",
+        "vivaldi.exe",
+        "opera.exe"
+    ],
+    "browser_title_hint": "",
+    "browser_focus_delay_ms": 120,
+    "browser_tab_delay_ms": 120,
+    "browser_url_delay_ms": 100,
+    "dilution_tracker_url_template": "https://dilutiontracker.com/app/search/{ticker}",
+    "always_on_top": true,
+    "window_x": 1915,
+    "window_y": 367
+}
