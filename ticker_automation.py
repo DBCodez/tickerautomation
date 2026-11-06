@@ -1,5 +1,5 @@
 """
-Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v1.8)
+Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v1.9)
 ============================================================================
 A lightweight, always-on-top dark-mode Windows background utility that:
 1. Exposes a native Win32 "Edit" control targetable by Trade-Ideas External Linking
@@ -46,7 +46,7 @@ from pynput import keyboard
 warnings.filterwarnings("ignore", category=FutureWarning)
 from pywinauto import Application
 
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 
 # Disable PyAutoGUI's default 100ms post-action pause so we control exact millisecond delays
 pyautogui.PAUSE = 0.01
@@ -124,6 +124,8 @@ THEME = {
     "bg_button_hover": "#30363D",
     "bg_accent": "#238636",
     "bg_accent_hover": "#2EA043",
+    "bg_dt_btn": "#1F6FEB",
+    "bg_dt_btn_hover": "#388BFD",
     "fg_primary": "#F0F6FC",
     "fg_secondary": "#8B949E",
     "fg_ticker": "#58A6FF",
@@ -748,19 +750,41 @@ class TickerAutomationApp:
         )
         self.settings_btn.pack(side="right")
 
-        # ---- ROW 3: Live Status Bar ----
+        # ---- ROW 3: Live Status Bar (Left) + DT Only Button (Right) ----
+        bottom_row = tk.Frame(self.main_frame, bg=THEME["bg_main"])
+        bottom_row.pack(fill="x", pady=(2, 0))
+
         self.status_var = tk.StringVar(
-            value=f"v{APP_VERSION} Ready • Click TI or type ticker | Alt+D or Deep-Dive launches"
+            value=f"v{APP_VERSION} Ready • Click TI or type ticker"
         )
         self.status_bar = tk.Label(
-            self.main_frame,
+            bottom_row,
             textvariable=self.status_var,
             font=("Segoe UI", 8),
             fg=THEME["fg_secondary"],
             bg=THEME["bg_main"],
             anchor="w",
+            width=28,
         )
-        self.status_bar.pack(fill="x")
+        self.status_bar.pack(side="left", fill="x", expand=True)
+
+        self.dt_only_btn = tk.Button(
+            bottom_row,
+            text="🌐 DT Only",
+            font=("Segoe UI", 8, "bold"),
+            bg=THEME["bg_dt_btn"],
+            fg=THEME["fg_primary"],
+            activebackground=THEME["bg_dt_btn_hover"],
+            activeforeground=THEME["fg_primary"],
+            relief="flat",
+            padx=8,
+            pady=1,
+            cursor="hand2",
+            command=lambda: self.trigger_deep_dive(
+                source="DT Only", skip_bookmap=True
+            ),
+        )
+        self.dt_only_btn.pack(side="right", padx=(6, 0))
 
         # ---- COLLAPSIBLE SETTINGS PANEL ----
         self.settings_frame = tk.Frame(
@@ -1322,7 +1346,7 @@ class TickerAutomationApp:
             self.staged_var.set(f"Staged: {ticker}")
             if not self._is_running_sequence:
                 self.set_status(
-                    f"Staged {ticker} • Press Alt+D or click Deep-Dive",
+                    f"Staged {ticker} • Alt+D / Deep-Dive or DT Only",
                     THEME["fg_ticker"],
                 )
         else:
@@ -1596,15 +1620,23 @@ class TickerAutomationApp:
     # Deep-Dive Automation Sequence (Step 1: Bookmap -> Step 2: DilutionTracker)
     # --------------------------------------------------------------------------
     def trigger_deep_dive(
-        self, source: str = "Manual", release_alt: bool = False
+        self,
+        source: str = "Manual",
+        release_alt: bool = False,
+        skip_bookmap: bool = False,
     ) -> None:
         """
         Executes the Deep-Dive sequence for staged_ticker on a background thread.
+        If skip_bookmap is True, skips Step 1 (Bookmap) and jumps directly to Step 2 (DilutionTracker).
         """
         if threading.current_thread() is threading.main_thread():
             threading.Thread(
                 target=self.trigger_deep_dive,
-                kwargs={"source": source, "release_alt": release_alt},
+                kwargs={
+                    "source": source,
+                    "release_alt": release_alt,
+                    "skip_bookmap": skip_bookmap,
+                },
                 daemon=True,
             ).start()
             return
@@ -1612,7 +1644,7 @@ class TickerAutomationApp:
         ticker = self._sync_entry_to_staged_ticker()
         if not ticker:
             self.set_status(
-                f"{source}: No staged ticker yet! Click a ticker in TI or type one.",
+                f"{source}: No staged ticker! Click TI or type one.",
                 THEME["fg_warning"],
             )
             return
@@ -1645,81 +1677,91 @@ class TickerAutomationApp:
             wait_for_input_settled(release_alt=release_alt, max_wait_sec=0.60)
 
             # ==================================================================
-            # STEP 1: BOOKMAP AUTOMATION
+            # STEP 1: BOOKMAP AUTOMATION (Skipped when skip_bookmap=True)
             # ==================================================================
-            self.set_status(
-                f"[{ticker}] Step 1/2: Focusing Bookmap...", THEME["fg_warning"]
-            )
-            bm_hwnd = self._find_bookmap_hwnd()
-            if bm_hwnd and self._focus_window(bm_hwnd, max_attempts=15):
-                bm_focus_ms = int(
-                    self.config.get("bookmap_focus_delay_ms", 220)
-                )
-                # Ensure Bookmap holds uninterrupted foreground focus for the full bm_focus_ms
-                self._wait_for_stable_foreground(
-                    bm_hwnd, settle_ms=bm_focus_ms, max_total_ms=900
-                )
-
-                wait_for_input_settled(
-                    release_alt=release_alt, max_wait_sec=0.15
-                )
-
-                # Send Ctrl+T with hardware scan codes and 40ms hold to open Subscribe dialog
-                send_ctrl_key_reliable("t", hold_sec=0.04)
-
-                bm_dialog_ms = int(
-                    self.config.get("bookmap_dialog_delay_ms", 280)
-                )
-                time.sleep(max(100, bm_dialog_ms) / 1000.0)
-
-                # Verify a Bookmap window (main chart or Subscribe dialog) is still foreground;
-                # if another process stole focus during Ctrl+T, re-focus Bookmap and retry Ctrl+T!
-                fg_now = user32.GetForegroundWindow()
-                if "bookmap" not in get_hwnd_process_name(fg_now).lower():
-                    self._focus_window(bm_hwnd, max_attempts=12)
-                    self._wait_for_stable_foreground(
-                        bm_hwnd, settle_ms=180, max_total_ms=600
-                    )
-                    send_ctrl_key_reliable("t", hold_sec=0.04)
-                    time.sleep(max(100, bm_dialog_ms) / 1000.0)
-
-                rect = wintypes.RECT()
-                user32.GetWindowRect(bm_hwnd, ctypes.byref(rect))
-                if self.config.get("bookmap_use_symbol_click", False):
-                    rel_x = int(self.config.get("bookmap_symbol_rel_x", 0))
-                    rel_y = int(self.config.get("bookmap_symbol_rel_y", 0))
-                    if rel_x > 0 or rel_y > 0:
-                        pyautogui.click(rect.left + rel_x, rect.top + rel_y)
-                        time.sleep(0.05)
-
-                # Copy ticker right before pasting so nothing can overwrite the clipboard
-                pyperclip.copy(ticker)
-                time.sleep(0.025)
-
-                send_ctrl_key_reliable("a", hold_sec=0.03)
-                time.sleep(0.035)
-                send_ctrl_key_reliable("v", hold_sec=0.035)
-                time.sleep(0.07)
-
-                if self.config.get("bookmap_use_subscribe_click", False):
-                    sub_x = int(self.config.get("bookmap_subscribe_rel_x", 0))
-                    sub_y = int(self.config.get("bookmap_subscribe_rel_y", 0))
-                    if sub_x > 0 or sub_y > 0:
-                        pyautogui.click(rect.left + sub_x, rect.top + sub_y)
-                        time.sleep(0.04)
-
-                send_enter_reliable(hold_sec=0.04)
-                time.sleep(0.10)
-            else:
+            if not skip_bookmap:
                 self.set_status(
-                    f"[{ticker}] Bookmap window not found — skipping to Step 2...",
+                    f"[{ticker}] Step 1/2: Focusing Bookmap...",
                     THEME["fg_warning"],
                 )
-                time.sleep(0.10)
+                bm_hwnd = self._find_bookmap_hwnd()
+                if bm_hwnd and self._focus_window(bm_hwnd, max_attempts=15):
+                    bm_focus_ms = int(
+                        self.config.get("bookmap_focus_delay_ms", 220)
+                    )
+                    # Ensure Bookmap holds uninterrupted foreground focus for the full bm_focus_ms
+                    self._wait_for_stable_foreground(
+                        bm_hwnd, settle_ms=bm_focus_ms, max_total_ms=900
+                    )
 
-            # Wait for Bookmap's Subscribe dialog to finish closing and releasing focus
-            trans_ms = int(self.config.get("step_transition_delay_ms", 250))
-            time.sleep(max(100, trans_ms) / 1000.0)
+                    wait_for_input_settled(
+                        release_alt=release_alt, max_wait_sec=0.15
+                    )
+
+                    # Send Ctrl+T with hardware scan codes and 40ms hold to open Subscribe dialog
+                    send_ctrl_key_reliable("t", hold_sec=0.04)
+
+                    bm_dialog_ms = int(
+                        self.config.get("bookmap_dialog_delay_ms", 280)
+                    )
+                    time.sleep(max(100, bm_dialog_ms) / 1000.0)
+
+                    # Verify a Bookmap window (main chart or Subscribe dialog) is still foreground;
+                    # if another process stole focus during Ctrl+T, re-focus Bookmap and retry Ctrl+T!
+                    fg_now = user32.GetForegroundWindow()
+                    if "bookmap" not in get_hwnd_process_name(fg_now).lower():
+                        self._focus_window(bm_hwnd, max_attempts=12)
+                        self._wait_for_stable_foreground(
+                            bm_hwnd, settle_ms=180, max_total_ms=600
+                        )
+                        send_ctrl_key_reliable("t", hold_sec=0.04)
+                        time.sleep(max(100, bm_dialog_ms) / 1000.0)
+
+                    rect = wintypes.RECT()
+                    user32.GetWindowRect(bm_hwnd, ctypes.byref(rect))
+                    if self.config.get("bookmap_use_symbol_click", False):
+                        rel_x = int(self.config.get("bookmap_symbol_rel_x", 0))
+                        rel_y = int(self.config.get("bookmap_symbol_rel_y", 0))
+                        if rel_x > 0 or rel_y > 0:
+                            pyautogui.click(
+                                rect.left + rel_x, rect.top + rel_y
+                            )
+                            time.sleep(0.05)
+
+                    # Copy ticker right before pasting so nothing can overwrite the clipboard
+                    pyperclip.copy(ticker)
+                    time.sleep(0.025)
+
+                    send_ctrl_key_reliable("a", hold_sec=0.03)
+                    time.sleep(0.035)
+                    send_ctrl_key_reliable("v", hold_sec=0.035)
+                    time.sleep(0.07)
+
+                    if self.config.get("bookmap_use_subscribe_click", False):
+                        sub_x = int(
+                            self.config.get("bookmap_subscribe_rel_x", 0)
+                        )
+                        sub_y = int(
+                            self.config.get("bookmap_subscribe_rel_y", 0)
+                        )
+                        if sub_x > 0 or sub_y > 0:
+                            pyautogui.click(
+                                rect.left + sub_x, rect.top + sub_y
+                            )
+                            time.sleep(0.04)
+
+                    send_enter_reliable(hold_sec=0.04)
+                    time.sleep(0.10)
+                else:
+                    self.set_status(
+                        f"[{ticker}] Bookmap not found — skipping to DT...",
+                        THEME["fg_warning"],
+                    )
+                    time.sleep(0.10)
+
+                # Wait for Bookmap's Subscribe dialog to finish closing and releasing focus
+                trans_ms = int(self.config.get("step_transition_delay_ms", 250))
+                time.sleep(max(100, trans_ms) / 1000.0)
 
             # ==================================================================
             # STEP 2: DILUTIONTRACKER PINNED TAB AUTOMATION
@@ -1727,8 +1769,9 @@ class TickerAutomationApp:
             tab_idx = max(
                 1, min(8, int(self.config.get("pinned_tab_index", 6)))
             )
+            step_label = "DT Only" if skip_bookmap else "Step 2/2"
             self.set_status(
-                f"[{ticker}] Step 2/2: Browser Ctrl+{tab_idx} -> DilutionTracker...",
+                f"[{ticker}] {step_label}: Browser Ctrl+{tab_idx} -> DilutionTracker...",
                 THEME["fg_warning"],
             )
 
@@ -1772,8 +1815,9 @@ class TickerAutomationApp:
                 time.sleep(0.12)
                 pyperclip.copy(ticker)
 
+                done_prefix = "DT Complete" if skip_bookmap else "Deep-Dive Complete"
                 self.set_status(
-                    f"Deep-Dive Complete: {ticker} ({source})",
+                    f"{done_prefix}: {ticker} ({source})",
                     THEME["fg_success"],
                 )
             else:
