@@ -1,5 +1,5 @@
 """
-Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v1.9)
+Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v2.0)
 ============================================================================
 A lightweight, always-on-top dark-mode Windows background utility that:
 1. Exposes a native Win32 "Edit" control targetable by Trade-Ideas External Linking
@@ -46,7 +46,7 @@ from pynput import keyboard
 warnings.filterwarnings("ignore", category=FutureWarning)
 from pywinauto import Application
 
-APP_VERSION = "1.9"
+APP_VERSION = "2.0"
 
 # Disable PyAutoGUI's default 100ms post-action pause so we control exact millisecond delays
 pyautogui.PAUSE = 0.01
@@ -164,6 +164,8 @@ ES_WANTRETURN = 0x1000
 WM_SETTEXT = 0x000C
 WM_CLOSE = 0x0010
 WM_SETFONT = 0x0030
+WM_SYSCOMMAND = 0x0112
+SC_RESTORE = 0xF120
 EM_SETSEL = 0x00B1
 
 VK_LBUTTON = 0x01
@@ -1404,7 +1406,7 @@ class TickerAutomationApp:
     ) -> list[tuple[int, str, str, str, int]]:
         """
         Returns list of (hwnd, title, exe_name_lower, class_name_lower, area)
-        for all visible top-level windows.
+        for all visible top-level windows (including minimized/iconic windows).
         """
         results = []
         own_pid = self._own_pid
@@ -1419,15 +1421,24 @@ class TickerAutomationApp:
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value == own_pid:
                 return True
-            rect = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            w = max(0, rect.right - rect.left)
-            h = max(0, rect.bottom - rect.top)
-            if w < 150 or h < 100:
-                return True
+
+            is_iconic = bool(user32.IsIconic(hwnd))
+            if is_iconic:
+                # Minimized windows report a tiny (-32000, -32000) 160x28 stub rect in
+                # GetWindowRect; assign a standard nominal area so they are never skipped.
+                area = 1280 * 800
+            else:
+                rect = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                w = max(0, rect.right - rect.left)
+                h = max(0, rect.bottom - rect.top)
+                if w < 150 or h < 100:
+                    return True
+                area = w * h
+
             exe_name = get_hwnd_process_name(hwnd).lower()
             cls_name = get_window_class(hwnd).lower()
-            results.append((hwnd, title, exe_name, cls_name, w * h))
+            results.append((hwnd, title, exe_name, cls_name, area))
             return True
 
         enum_proc = WNDENUMPROC(callback)
@@ -1525,14 +1536,10 @@ class TickerAutomationApp:
 
     def _force_focus_single_attempt(self, hwnd: int) -> None:
         """
-        Single low-level attempt to bring hwnd to the foreground WITHOUT ever
-        sending VK_MENU (Alt), which would otherwise activate Java Swing's
-        menu bar (SC_KEYMENU) in Bookmap and swallow Ctrl+T!
+        Single low-level attempt to un-minimize (if iconic) and bring hwnd to the
+        foreground WITHOUT ever sending VK_MENU (Alt), which would otherwise activate
+        Java Swing's menu bar (SC_KEYMENU) in Bookmap and swallow Ctrl+T!
         """
-        if user32.IsIconic(hwnd):
-            user32.ShowWindow(hwnd, SW_RESTORE)
-            time.sleep(0.04)
-
         fg_hwnd = user32.GetForegroundWindow()
         fg_tid = (
             user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
@@ -1555,7 +1562,21 @@ class TickerAutomationApp:
             # Send unassigned VK 0x0E key-up ONLY (never Alt/VK_MENU!) to satisfy
             # Windows' foreground input lock check without triggering any menu bar
             user32.keybd_event(0x0E, 0, KEYEVENTF_KEYUP, 0)
-            user32.ShowWindow(hwnd, SW_SHOW)
+
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                if user32.IsIconic(hwnd):
+                    user32.SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
+                t_restore = time.perf_counter()
+                while (
+                    user32.IsIconic(hwnd)
+                    and (time.perf_counter() - t_restore) < 0.20
+                ):
+                    time.sleep(0.015)
+                time.sleep(0.05)
+            else:
+                user32.ShowWindow(hwnd, SW_SHOW)
+
             user32.BringWindowToTop(hwnd)
             user32.SetForegroundWindow(hwnd)
             user32.SetFocus(hwnd)
@@ -1565,10 +1586,13 @@ class TickerAutomationApp:
             if attached_fg:
                 user32.AttachThreadInput(cur_tid, fg_tid, False)
 
-        if user32.GetForegroundWindow() != hwnd:
+        if user32.GetForegroundWindow() != hwnd or user32.IsIconic(hwnd):
             try:
                 app = Application(backend="win32").connect(handle=hwnd)
-                app.window(handle=hwnd).set_focus()
+                win = app.window(handle=hwnd)
+                if user32.IsIconic(hwnd):
+                    win.restore()
+                win.set_focus()
             except Exception:
                 pass
 
@@ -1590,9 +1614,15 @@ class TickerAutomationApp:
             except Exception as e:
                 log_error(f"Focus attempt {attempt + 1} failed for {hwnd}", e)
             time.sleep(0.04)
-            if user32.GetForegroundWindow() == hwnd:
+            if (
+                user32.GetForegroundWindow() == hwnd
+                and not user32.IsIconic(hwnd)
+            ):
                 return True
-        return user32.GetForegroundWindow() == hwnd
+        return (
+            user32.GetForegroundWindow() == hwnd
+            and not user32.IsIconic(hwnd)
+        )
 
     def _wait_for_stable_foreground(
         self, hwnd: int, settle_ms: int, max_total_ms: int = 900
@@ -1607,7 +1637,10 @@ class TickerAutomationApp:
         stable_since = time.perf_counter()
 
         while time.perf_counter() < deadline:
-            if user32.GetForegroundWindow() != hwnd:
+            if (
+                user32.GetForegroundWindow() != hwnd
+                or user32.IsIconic(hwnd)
+            ):
                 self._focus_window(hwnd, max_attempts=8)
                 stable_since = time.perf_counter()
             elif (time.perf_counter() - stable_since) >= settle_sec:
@@ -1776,15 +1809,26 @@ class TickerAutomationApp:
             )
 
             browser_hwnd = self._find_browser_hwnd()
+            br_was_minimized = bool(
+                browser_hwnd and user32.IsIconic(browser_hwnd)
+            )
             if browser_hwnd and self._focus_window(browser_hwnd, max_attempts=15):
                 br_focus_ms = int(
                     self.config.get("browser_focus_delay_ms", 120)
                 )
-                time.sleep(max(40, br_focus_ms) / 1000.0)
+                if br_was_minimized:
+                    # Give the browser extra time to finish restoring from minimized state
+                    self._wait_for_stable_foreground(
+                        browser_hwnd,
+                        settle_ms=max(240, br_focus_ms + 120),
+                        max_total_ms=900,
+                    )
+                else:
+                    time.sleep(max(40, br_focus_ms) / 1000.0)
 
                 if user32.GetForegroundWindow() != browser_hwnd:
                     self._focus_window(browser_hwnd, max_attempts=8)
-                    time.sleep(0.05)
+                    time.sleep(0.06)
 
                 send_ctrl_key_reliable(str(tab_idx), hold_sec=0.03)
 
