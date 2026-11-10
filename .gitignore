@@ -7,3 +7,5 @@ env/
 error.log
 click_debug.log
 *.lnk
+AGENTS.md
+
