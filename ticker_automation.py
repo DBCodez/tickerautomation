@@ -1,5 +1,5 @@
 """
-Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v2.0)
+Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v2.1)
 ============================================================================
 A lightweight, always-on-top dark-mode Windows background utility that:
 1. Exposes a native Win32 "Edit" control targetable by Trade-Ideas External Linking
@@ -46,7 +46,7 @@ from pynput import keyboard
 warnings.filterwarnings("ignore", category=FutureWarning)
 from pywinauto import Application
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 # Disable PyAutoGUI's default 100ms post-action pause so we control exact millisecond delays
 pyautogui.PAUSE = 0.01
@@ -124,6 +124,8 @@ THEME = {
     "bg_button_hover": "#30363D",
     "bg_accent": "#238636",
     "bg_accent_hover": "#2EA043",
+    "bg_bm_btn": "#8957E5",
+    "bg_bm_btn_hover": "#A371F7",
     "bg_dt_btn": "#1F6FEB",
     "bg_dt_btn_hover": "#388BFD",
     "fg_primary": "#F0F6FC",
@@ -752,12 +754,12 @@ class TickerAutomationApp:
         )
         self.settings_btn.pack(side="right")
 
-        # ---- ROW 3: Live Status Bar (Left) + DT Only Button (Right) ----
+        # ---- ROW 3: Live Status Bar (Left) + BM Only & DT Only Buttons (Right) ----
         bottom_row = tk.Frame(self.main_frame, bg=THEME["bg_main"])
         bottom_row.pack(fill="x", pady=(2, 0))
 
         self.status_var = tk.StringVar(
-            value=f"v{APP_VERSION} Ready • Click TI or type ticker"
+            value=f"v{APP_VERSION} Ready • Click TI or type"
         )
         self.status_bar = tk.Label(
             bottom_row,
@@ -766,27 +768,45 @@ class TickerAutomationApp:
             fg=THEME["fg_secondary"],
             bg=THEME["bg_main"],
             anchor="w",
-            width=28,
+            width=21,
         )
         self.status_bar.pack(side="left", fill="x", expand=True)
 
         self.dt_only_btn = tk.Button(
             bottom_row,
-            text="🌐 DT Only",
+            text="🌐 DT",
             font=("Segoe UI", 8, "bold"),
             bg=THEME["bg_dt_btn"],
             fg=THEME["fg_primary"],
             activebackground=THEME["bg_dt_btn_hover"],
             activeforeground=THEME["fg_primary"],
             relief="flat",
-            padx=8,
+            padx=6,
             pady=1,
             cursor="hand2",
             command=lambda: self.trigger_deep_dive(
                 source="DT Only", skip_bookmap=True
             ),
         )
-        self.dt_only_btn.pack(side="right", padx=(6, 0))
+        self.dt_only_btn.pack(side="right", padx=(4, 0))
+
+        self.bm_only_btn = tk.Button(
+            bottom_row,
+            text="📊 BM",
+            font=("Segoe UI", 8, "bold"),
+            bg=THEME["bg_bm_btn"],
+            fg=THEME["fg_primary"],
+            activebackground=THEME["bg_bm_btn_hover"],
+            activeforeground=THEME["fg_primary"],
+            relief="flat",
+            padx=6,
+            pady=1,
+            cursor="hand2",
+            command=lambda: self.trigger_deep_dive(
+                source="BM Only", skip_browser=True
+            ),
+        )
+        self.bm_only_btn.pack(side="right", padx=(6, 0))
 
         # ---- COLLAPSIBLE SETTINGS PANEL ----
         self.settings_frame = tk.Frame(
@@ -1348,7 +1368,7 @@ class TickerAutomationApp:
             self.staged_var.set(f"Staged: {ticker}")
             if not self._is_running_sequence:
                 self.set_status(
-                    f"Staged {ticker} • Alt+D / Deep-Dive or DT Only",
+                    f"Staged {ticker} • Ready",
                     THEME["fg_ticker"],
                 )
         else:
@@ -1657,10 +1677,12 @@ class TickerAutomationApp:
         source: str = "Manual",
         release_alt: bool = False,
         skip_bookmap: bool = False,
+        skip_browser: bool = False,
     ) -> None:
         """
         Executes the Deep-Dive sequence for staged_ticker on a background thread.
-        If skip_bookmap is True, skips Step 1 (Bookmap) and jumps directly to Step 2 (DilutionTracker).
+        - skip_bookmap=True: skips Step 1 (Bookmap) and runs only Step 2 (DilutionTracker).
+        - skip_browser=True: runs only Step 1 (Bookmap) and skips Step 2 (DilutionTracker).
         """
         if threading.current_thread() is threading.main_thread():
             threading.Thread(
@@ -1669,6 +1691,7 @@ class TickerAutomationApp:
                     "source": source,
                     "release_alt": release_alt,
                     "skip_bookmap": skip_bookmap,
+                    "skip_browser": skip_browser,
                 },
                 daemon=True,
             ).start()
@@ -1677,7 +1700,7 @@ class TickerAutomationApp:
         ticker = self._sync_entry_to_staged_ticker()
         if not ticker:
             self.set_status(
-                f"{source}: No staged ticker! Click TI or type one.",
+                f"{source}: No staged ticker!",
                 THEME["fg_warning"],
             )
             return
@@ -1713,8 +1736,9 @@ class TickerAutomationApp:
             # STEP 1: BOOKMAP AUTOMATION (Skipped when skip_bookmap=True)
             # ==================================================================
             if not skip_bookmap:
+                bm_step_label = "BM Only" if skip_browser else "Step 1/2"
                 self.set_status(
-                    f"[{ticker}] Step 1/2: Focusing Bookmap...",
+                    f"[{ticker}] {bm_step_label}: Focusing Bookmap...",
                     THEME["fg_warning"],
                 )
                 bm_hwnd = self._find_bookmap_hwnd()
@@ -1785,7 +1809,20 @@ class TickerAutomationApp:
 
                     send_enter_reliable(hold_sec=0.04)
                     time.sleep(0.10)
+
+                    if skip_browser:
+                        self.set_status(
+                            f"BM Complete: {ticker} ({source})",
+                            THEME["fg_success"],
+                        )
+                        return
                 else:
+                    if skip_browser:
+                        self.set_status(
+                            f"[{ticker}] Bookmap window not found!",
+                            THEME["fg_error"],
+                        )
+                        return
                     self.set_status(
                         f"[{ticker}] Bookmap not found — skipping to DT...",
                         THEME["fg_warning"],
