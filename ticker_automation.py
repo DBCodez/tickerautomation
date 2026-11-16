@@ -1,5 +1,5 @@
 """
-Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v2.1)
+Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v2.2)
 ============================================================================
 A lightweight, always-on-top dark-mode Windows background utility that:
 1. Exposes a native Win32 "Edit" control targetable by Trade-Ideas External Linking
@@ -9,21 +9,20 @@ A lightweight, always-on-top dark-mode Windows background utility that:
    (via ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL).
 3. Triggers the Deep-Dive sequence when:
    - The global hotkey (Alt+D) is pressed at any time, OR
-   - The green "🚀 Deep-Dive (Alt+D)" button in the GUI is clicked.
+   - The GUI buttons ("🚀 Deep-Dive (Alt+D)", "📊 BM", or "🌐 DT") are clicked.
 4. Step 1 (Bookmap):
    - Waits for any active Trade-Ideas External Linking macro (to our box and Thinkorswim)
-     to finish settling, and waits for physical Alt / D / mouse button release.
-   - Focuses the main Bookmap chart window WITHOUT tapping VK_MENU (Alt) so Bookmap's
-     Java Swing menu bar (SC_KEYMENU) is never accidentally activated.
+     to finish settling, and waits for physical modifier / mouse button release.
+   - Dismisses any stale modal popup blocking Bookmap, restores Bookmap if minimized,
+     and focuses the main Bookmap chart window WITHOUT ever tapping VK_MENU (Alt)
+     so Bookmap's Java Swing menu bar (SC_KEYMENU) is never activated.
    - Verifies Bookmap holds uninterrupted foreground focus across bookmap_focus_delay_ms
-     (re-focusing if Trade-Ideas/Thinkorswim steals focus).
-   - Sends Ctrl+T using Win32 hardware scan codes and explicit key-down hold duration,
-     verifies Bookmap retains foreground focus after Ctrl+T (retrying if stolen),
-     copies the ticker immediately before Ctrl+A / Ctrl+V, and presses Enter.
+     before sending Ctrl+T, Ctrl+A, Ctrl+V, and Enter with hardware scan codes.
 5. Step 2 (DilutionTracker):
-   - Reliably focuses the main browser window -> Ctrl+<1-8> (default Ctrl+6) ->
-     Ctrl+L -> pastes https://dilutiontracker.com/app/search/{staged_ticker} -> Enter.
-6. Persists all settings (tab index, delays, fallback coordinates) to config.json.
+   - Restores (if minimized) and focuses the main browser window -> Ctrl+<1-8>
+     (default Ctrl+6) -> Ctrl+L -> pastes https://dilutiontracker.com/app/search/{ticker}
+     -> Enter.
+6. Persists all settings atomically to config.json with multi-monitor bounds validation.
 """
 
 import os
@@ -35,7 +34,6 @@ import ctypes
 from ctypes import wintypes
 import traceback
 import threading
-import warnings
 import tkinter as tk
 
 import psutil
@@ -43,10 +41,8 @@ import pyperclip
 import pyautogui
 from pynput import keyboard
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-from pywinauto import Application
-
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
+CONFIG_SCHEMA_VERSION = 2
 
 # Disable PyAutoGUI's default 100ms post-action pause so we control exact millisecond delays
 pyautogui.PAUSE = 0.01
@@ -78,7 +74,20 @@ def log_error(context: str, exc: BaseException | None = None) -> None:
         pass
 
 
+def _safe_int(val, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        res = int(float(str(val).strip()))
+    except Exception:
+        res = default
+    if minimum is not None:
+        res = max(minimum, res)
+    if maximum is not None:
+        res = min(maximum, res)
+    return res
+
+
 DEFAULT_CONFIG = {
+    "config_schema_version": CONFIG_SCHEMA_VERSION,
     "pinned_tab_index": 6,
     "hotkey": "<alt>+d",
     "ti_settle_guard_ms": 400,
@@ -152,6 +161,18 @@ WNDENUMPROC = ctypes.WINFUNCTYPE(
     wintypes.LPARAM,
 )
 
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
 # Window Styles & Messages
 WS_CHILD = 0x40000000
 WS_VISIBLE = 0x10000000
@@ -168,12 +189,19 @@ WM_CLOSE = 0x0010
 WM_SETFONT = 0x0030
 WM_SYSCOMMAND = 0x0112
 SC_RESTORE = 0xF120
+EM_GETSEL = 0x00B0
 EM_SETSEL = 0x00B1
+
+SMTO_ABORTIFHUNG = 0x0002
+GW_ENABLEDPOPUP = 6
+MONITOR_DEFAULTTONULL = 0
 
 VK_LBUTTON = 0x01
 VK_RETURN = 0x0D
+VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_MENU = 0x12   # Alt key
+VK_ESCAPE = 0x1B
 VK_LMENU = 0xA4  # Left Alt
 VK_RMENU = 0xA5  # Right Alt
 VK_D = 0x44
@@ -211,6 +239,17 @@ user32.SendMessageW.argtypes = [
     wintypes.LPARAM,
 ]
 user32.SendMessageW.restype = ctypes.c_ssize_t
+
+user32.SendMessageTimeoutW.argtypes = [
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+    wintypes.UINT,
+    wintypes.UINT,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
 
 user32.PostMessageW.argtypes = [
     wintypes.HWND,
@@ -257,8 +296,26 @@ user32.GetFocus.restype = wintypes.HWND
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 user32.GetCursorPos.restype = wintypes.BOOL
 
+user32.WindowFromPoint.argtypes = [wintypes.POINT]
+user32.WindowFromPoint.restype = wintypes.HWND
+
+user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+user32.MonitorFromPoint.restype = wintypes.HANDLE
+
 user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.ShowWindow.restype = wintypes.BOOL
+
+user32.IsWindowEnabled.argtypes = [wintypes.HWND]
+user32.IsWindowEnabled.restype = wintypes.BOOL
+
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindow.restype = wintypes.HWND
+
+user32.GetWindowPlacement.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(WINDOWPLACEMENT),
+]
+user32.GetWindowPlacement.restype = wintypes.BOOL
 
 user32.AttachThreadInput.argtypes = [
     wintypes.DWORD,
@@ -331,6 +388,9 @@ gdi32.CreateFontW.argtypes = [
 ]
 gdi32.CreateFontW.restype = wintypes.HFONT
 
+gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+gdi32.DeleteObject.restype = wintypes.BOOL
+
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 
@@ -363,6 +423,14 @@ def clean_ticker(raw_text: str) -> str:
         if cleaned[:half] == cleaned[half:]:
             cleaned = cleaned[:half]
     return cleaned[:12]
+
+
+def get_hwnd_pid(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
 
 
 def get_hwnd_process_info(hwnd: int) -> tuple[str, str, int]:
@@ -452,20 +520,21 @@ def apply_dark_titlebar(hwnd: int) -> None:
 
 def close_previous_instances() -> None:
     """
-    Finds any previously running 'TI Ticker Deep-Dive' window from an older instance
-    and sends WM_CLOSE so two instances never compete for Alt+D or Trade-Ideas links.
+    Finds any previously running 'TI Ticker Deep-Dive' Tkinter window (`TkTopLevel`)
+    from an older instance and sends WM_CLOSE so two instances never compete for
+    Alt+D or Trade-Ideas links.
     """
     own_pid = os.getpid()
 
     def cb(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
             return True
-        pid = wintypes.DWORD(0)
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == own_pid:
+        pid = get_hwnd_pid(hwnd)
+        if pid == own_pid:
             return True
         title = get_window_text(hwnd)
-        if title.startswith("TI Ticker Deep-Dive"):
+        cls_name = get_window_class(hwnd).lower()
+        if title.startswith("TI Ticker Deep-Dive") and "tk" in cls_name:
             user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
         return True
 
@@ -485,48 +554,74 @@ def _vk_key_event(vk: int, key_up: bool = False) -> None:
 def send_ctrl_key_reliable(key_char: str, hold_sec: float = 0.04) -> None:
     """
     Sends Ctrl+<key_char> using Win32 virtual keys + hardware scan codes and explicit
-    hold durations on BOTH Ctrl and the target key so Java Swing / OpenGL windows
-    like Bookmap never drop synthetic key chords.
+    hold durations on BOTH Ctrl and the target key. Uses try/finally so VK_CONTROL
+    can never be left stuck down if interrupted.
     """
     ch = key_char.upper()
     vk = ord(ch[0])
     _vk_key_event(VK_CONTROL, key_up=False)
-    time.sleep(hold_sec)
-    _vk_key_event(vk, key_up=False)
-    time.sleep(hold_sec)
-    _vk_key_event(vk, key_up=True)
-    time.sleep(max(0.02, hold_sec * 0.6))
-    _vk_key_event(VK_CONTROL, key_up=True)
+    try:
+        time.sleep(hold_sec)
+        _vk_key_event(vk, key_up=False)
+        try:
+            time.sleep(hold_sec)
+        finally:
+            _vk_key_event(vk, key_up=True)
+        time.sleep(max(0.02, hold_sec * 0.6))
+    finally:
+        _vk_key_event(VK_CONTROL, key_up=True)
 
 
 def send_enter_reliable(hold_sec: float = 0.04) -> None:
     """Sends Enter (VK_RETURN) with hardware scan code and explicit hold duration."""
     _vk_key_event(VK_RETURN, key_up=False)
-    time.sleep(hold_sec)
-    _vk_key_event(VK_RETURN, key_up=True)
+    try:
+        time.sleep(hold_sec)
+    finally:
+        _vk_key_event(VK_RETURN, key_up=True)
+
+
+def send_escape_reliable(hold_sec: float = 0.03) -> None:
+    """Sends Escape (VK_ESCAPE) with hardware scan code and explicit hold duration."""
+    _vk_key_event(VK_ESCAPE, key_up=False)
+    try:
+        time.sleep(hold_sec)
+    finally:
+        _vk_key_event(VK_ESCAPE, key_up=True)
+
+
+def _is_any_alt_down() -> bool:
+    return (
+        (user32.GetAsyncKeyState(VK_MENU) & 0x8000) != 0
+        or (user32.GetAsyncKeyState(VK_LMENU) & 0x8000) != 0
+        or (user32.GetAsyncKeyState(VK_RMENU) & 0x8000) != 0
+    )
 
 
 def wait_for_input_settled(
     release_alt: bool = False, max_wait_sec: float = 0.60
 ) -> None:
     """
-    Waits until physical Alt, D, and Left Mouse Button are released so neither
-    Alt+D nor clicking the GUI button interferes with Bookmap focus or Ctrl+T.
+    Waits until physical Alt, Ctrl, Shift, D, and Left Mouse Button are released
+    BEFORE focusing target windows so neither Alt+D nor clicking the GUI button
+    interferes with Bookmap focus or Ctrl+T.
+    Only sends synthetic Alt key-up if Alt is still reported down after waiting,
+    and must NEVER be called with release_alt=True while Bookmap is focused.
     """
     t0 = time.perf_counter()
     while (time.perf_counter() - t0) < max_wait_sec:
-        alt_down = (
-            (user32.GetAsyncKeyState(VK_MENU) & 0x8000) != 0
-            or (user32.GetAsyncKeyState(VK_LMENU) & 0x8000) != 0
-            or (user32.GetAsyncKeyState(VK_RMENU) & 0x8000) != 0
+        mod_down = (
+            _is_any_alt_down()
             or (user32.GetAsyncKeyState(VK_D) & 0x8000) != 0
+            or (user32.GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0
+            or (user32.GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0
         )
         mouse_down = (user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
-        if not alt_down and not mouse_down:
+        if not mod_down and not mouse_down:
             break
         time.sleep(0.015)
 
-    if release_alt:
+    if release_alt and _is_any_alt_down():
         try:
             _vk_key_event(VK_LMENU, key_up=True)
             _vk_key_event(VK_RMENU, key_up=True)
@@ -547,7 +642,7 @@ class TickerAutomationApp:
         self._closing = False
 
         self.staged_ticker: str = ""
-        self._settled_ticker: str = ""
+        self._unselected_idle_prefix: str = ""
         self._last_raw_entry_text: str = ""
         self._last_entry_change_ts: float = 0.0
         self._last_ti_burst_ts: float = 0.0
@@ -573,7 +668,7 @@ class TickerAutomationApp:
         self._hotkey_listener = None
         self._settings_expanded = False
 
-        # Unlock Windows foreground activation lock timeout for our process
+        # Unlock Windows foreground activation lock timeout for the interactive session
         try:
             user32.SystemParametersInfoW(
                 SPI_SETFOREGROUNDLOCKTIMEOUT, 0, ctypes.c_void_p(0), 0
@@ -588,36 +683,73 @@ class TickerAutomationApp:
         self._schedule_entry_poll()
 
     # --------------------------------------------------------------------------
-    # Configuration Persistence
+    # Configuration Persistence (Atomic & Schema-Versioned)
     # --------------------------------------------------------------------------
     def load_config(self) -> dict:
         cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        loaded_schema = 0
         if os.path.exists(CONFIG_PATH):
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                 if isinstance(loaded, dict):
+                    loaded_schema = _safe_int(loaded.get("config_schema_version", 0), 0)
                     cfg.update(loaded)
             except Exception as e:
                 log_error("Failed to read config.json", e)
-        if int(cfg.get("bookmap_focus_delay_ms", 220)) <= 100:
-            cfg["bookmap_focus_delay_ms"] = 220
-        if int(cfg.get("bookmap_dialog_delay_ms", 280)) <= 200:
-            cfg["bookmap_dialog_delay_ms"] = 280
+
+        # Sanitize numeric fields safely
+        cfg["pinned_tab_index"] = _safe_int(cfg.get("pinned_tab_index"), 6, 1, 8)
+        cfg["ti_settle_guard_ms"] = _safe_int(cfg.get("ti_settle_guard_ms"), 400, 0, 5000)
+        cfg["bookmap_focus_delay_ms"] = _safe_int(cfg.get("bookmap_focus_delay_ms"), 220, 50, 5000)
+        cfg["bookmap_dialog_delay_ms"] = _safe_int(cfg.get("bookmap_dialog_delay_ms"), 280, 50, 5000)
+        cfg["step_transition_delay_ms"] = _safe_int(cfg.get("step_transition_delay_ms"), 250, 50, 5000)
+        cfg["browser_focus_delay_ms"] = _safe_int(cfg.get("browser_focus_delay_ms"), 120, 20, 5000)
+        cfg["browser_tab_delay_ms"] = _safe_int(cfg.get("browser_tab_delay_ms"), 120, 20, 5000)
+        cfg["browser_url_delay_ms"] = _safe_int(cfg.get("browser_url_delay_ms"), 100, 20, 5000)
+
+        # One-time migration from legacy v1.x defaults (100ms / 200ms)
+        if loaded_schema < CONFIG_SCHEMA_VERSION:
+            if cfg["bookmap_focus_delay_ms"] <= 100:
+                cfg["bookmap_focus_delay_ms"] = 220
+            if cfg["bookmap_dialog_delay_ms"] <= 200:
+                cfg["bookmap_dialog_delay_ms"] = 280
+            cfg["config_schema_version"] = CONFIG_SCHEMA_VERSION
+
         self.save_config(cfg)
         return cfg
 
     def save_config(self, cfg: dict | None = None) -> None:
         target = cfg if cfg is not None else self.config
+        tmp_path = CONFIG_PATH + ".tmp"
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(target, f, indent=4)
+            os.replace(tmp_path, CONFIG_PATH)
         except Exception as e:
             log_error("Failed to save config.json", e)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
     # --------------------------------------------------------------------------
     # GUI Setup & Construction
     # --------------------------------------------------------------------------
+    def _is_position_on_any_monitor(self, x: int, y: int) -> bool:
+        """
+        Verifies that the saved window position is visible on an active monitor
+        (prevents spawning off-screen when moving config.json from a multi-monitor
+        desktop to a single-screen laptop).
+        """
+        try:
+            pt = wintypes.POINT(int(x) + 60, int(y) + 25)
+            hmon = user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONULL)
+            return bool(hmon)
+        except Exception:
+            return True
+
     def _setup_window(self) -> None:
         self.root.title(f"TI Ticker Deep-Dive v{APP_VERSION}")
         self.root.configure(bg=THEME["bg_main"])
@@ -628,7 +760,11 @@ class TickerAutomationApp:
 
         win_x = self.config.get("window_x")
         win_y = self.config.get("window_y")
-        if isinstance(win_x, int) and isinstance(win_y, int):
+        if (
+            isinstance(win_x, int)
+            and isinstance(win_y, int)
+            and self._is_position_on_any_monitor(win_x, win_y)
+        ):
             self.root.geometry(f"+{win_x}+{win_y}")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -701,7 +837,7 @@ class TickerAutomationApp:
         tab_lbl.pack(side="left", padx=(0, 4))
 
         self.tab_index_var = tk.IntVar(
-            value=max(1, min(8, int(self.config.get("pinned_tab_index", 6))))
+            value=_safe_int(self.config.get("pinned_tab_index", 6), 6, 1, 8)
         )
         self.tab_spinbox = tk.Spinbox(
             ctrl_row,
@@ -1025,8 +1161,7 @@ class TickerAutomationApp:
 
     def _on_quick_tab_change(self) -> None:
         try:
-            idx = int(self.tab_index_var.get())
-            idx = max(1, min(8, idx))
+            idx = _safe_int(self.tab_index_var.get(), 6, 1, 8)
             self.tab_index_var.set(idx)
             self.config["pinned_tab_index"] = idx
             self.save_config()
@@ -1038,6 +1173,7 @@ class TickerAutomationApp:
 
     def _save_settings_from_ui(self) -> None:
         try:
+            self.config["config_schema_version"] = CONFIG_SCHEMA_VERSION
             self.config["pinned_tab_index"] = max(
                 1, min(8, int(self.tab_index_var.get()))
             )
@@ -1186,6 +1322,15 @@ class TickerAutomationApp:
 
         self.entry_container.bind("<Configure>", on_container_resize)
 
+    def _is_edit_all_selected(self, raw_len: int) -> bool:
+        """Returns True if the Win32 Edit control currently has all text selected [0..raw_len]."""
+        if not self.edit_hwnd or raw_len <= 0:
+            return True
+        sel = int(user32.SendMessageW(self.edit_hwnd, EM_GETSEL, 0, 0))
+        sel_start = sel & 0xFFFF
+        sel_end = (sel >> 16) & 0xFFFF
+        return sel_start == 0 and sel_end >= raw_len
+
     def focus_manual_entry(self, select_all: bool = True) -> None:
         """
         Gives Win32 keyboard focus directly to self.edit_hwnd (overriding Tkinter's
@@ -1194,7 +1339,7 @@ class TickerAutomationApp:
         if not self.edit_hwnd:
             return
         self._manual_edit_active = True
-        self._settled_ticker = ""
+        self._unselected_idle_prefix = ""
 
         if self._top_hwnd and user32.GetForegroundWindow() != self._top_hwnd:
             user32.SetForegroundWindow(self._top_hwnd)
@@ -1262,6 +1407,7 @@ class TickerAutomationApp:
         if self._was_our_window_fg and not is_our_fg:
             # User just switched away from our window -> re-arm select-all for Trade-Ideas
             self._manual_edit_active = False
+            self._unselected_idle_prefix = ""
             user32.SendMessageW(self.edit_hwnd, EM_SETSEL, 0, -1)
         self._was_our_window_fg = is_our_fg
 
@@ -1284,13 +1430,18 @@ class TickerAutomationApp:
         )
 
         if in_edit:
-            was_already_editing = (
-                self._manual_edit_active and user32.GetFocus() == self.edit_hwnd
-            )
-            self.focus_manual_entry(select_all=not was_already_editing)
+            hit_hwnd = user32.WindowFromPoint(pt)
+            hit_root = user32.GetAncestor(hit_hwnd, GA_ROOT) if hit_hwnd else 0
+            if hit_root == self._top_hwnd or hit_hwnd == self.edit_hwnd:
+                was_already_editing = (
+                    self._manual_edit_active
+                    and user32.GetFocus() == self.edit_hwnd
+                )
+                self.focus_manual_entry(select_all=not was_already_editing)
         elif self._manual_edit_active:
             # Clicked outside the edit box -> exit manual edit mode and select all
             self._manual_edit_active = False
+            self._unselected_idle_prefix = ""
             user32.SendMessageW(self.edit_hwnd, EM_SETSEL, 0, -1)
 
     def get_entry_text(self) -> str:
@@ -1316,6 +1467,7 @@ class TickerAutomationApp:
         has_newline = "\r" in raw or "\n" in raw
 
         if raw != self._last_raw_entry_text:
+            prev_raw_stripped = self._last_raw_entry_text.strip()
             self._last_raw_entry_text = raw
             self._last_entry_change_ts = now
             if not self._manual_edit_active or has_newline:
@@ -1323,29 +1475,38 @@ class TickerAutomationApp:
             self._entry_burst_armed_for_overwrite = False
 
             cleaned = clean_ticker(raw)
+            # Only strip a previous ticker prefix if:
+            # 1) A newline arrived at the end of a Trade-Ideas burst,
+            # 2) The previous idle text was actually UNSELECTED (so TI appended onto it
+            #    instead of overwriting it), AND
+            # 3) More than just '\r\n' was added (so pressing Enter after manual typing
+            #    never strips characters from what the user just typed).
             if (
                 has_newline
-                and not self._manual_edit_active
-                and self._settled_ticker
-                and cleaned.startswith(self._settled_ticker)
-                and len(cleaned) > len(self._settled_ticker)
+                and self._unselected_idle_prefix
+                and cleaned != clean_ticker(prev_raw_stripped)
+                and cleaned.startswith(self._unselected_idle_prefix)
+                and len(cleaned) > len(self._unselected_idle_prefix)
             ):
-                cleaned = cleaned[len(self._settled_ticker) :]
+                cleaned = cleaned[len(self._unselected_idle_prefix) :]
 
             if cleaned:
                 self.staged_ticker = cleaned
                 self.root.after(0, self._update_staged_ui, cleaned)
             elif not raw.strip():
                 self.staged_ticker = ""
-                self._settled_ticker = ""
+                self._unselected_idle_prefix = ""
                 self.root.after(0, self._update_staged_ui, "")
         else:
-            if (
-                not self._manual_edit_active
-                and raw
-                and (now - self._last_entry_change_ts) >= 0.30
-            ):
-                self._settled_ticker = self.staged_ticker
+            if raw and (now - self._last_entry_change_ts) >= 0.30:
+                if self._is_edit_all_selected(len(raw)):
+                    self._unselected_idle_prefix = ""
+                elif not self._manual_edit_active:
+                    # Re-arm full selection on idle non-manual text so next TI burst overwrites
+                    user32.SendMessageW(self.edit_hwnd, EM_SETSEL, 0, -1)
+                    self._unselected_idle_prefix = ""
+                else:
+                    self._unselected_idle_prefix = self.staged_ticker
 
         # When Trade-Ideas sends VK_RETURN ('\r\n') OR when the user presses Enter in
         # the box, immediately strip the newline and select all so the next ticker
@@ -1353,12 +1514,12 @@ class TickerAutomationApp:
         if has_newline:
             self._entry_burst_armed_for_overwrite = True
             self._manual_edit_active = False
+            self._unselected_idle_prefix = ""
             if self.edit_hwnd:
                 cleaned = self.staged_ticker or clean_ticker(raw)
                 if cleaned and raw != cleaned:
                     set_window_text(self.edit_hwnd, cleaned)
                     self._last_raw_entry_text = cleaned
-                self._settled_ticker = cleaned
                 user32.SendMessageW(self.edit_hwnd, EM_SETSEL, 0, -1)
 
         return self.staged_ticker
@@ -1421,6 +1582,30 @@ class TickerAutomationApp:
     # --------------------------------------------------------------------------
     # Window Discovery & Verified Focus Helpers (Bookmap & Browser)
     # --------------------------------------------------------------------------
+    def _get_restored_window_area(self, hwnd: int) -> int:
+        """
+        Returns the normal/restored pixel area of an HWND (using GetWindowPlacement
+        when minimized so iconic windows are ranked by their true restored size).
+        """
+        if user32.IsIconic(hwnd):
+            wp = WINDOWPLACEMENT()
+            wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+            if user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                rc = wp.rcNormalPosition
+                w = max(0, rc.right - rc.left)
+                h = max(0, rc.bottom - rc.top)
+                if w >= 150 and h >= 100:
+                    return w * h
+            return 1280 * 800
+
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        w = max(0, rect.right - rect.left)
+        h = max(0, rect.bottom - rect.top)
+        if w < 150 or h < 100:
+            return 0
+        return w * h
+
     def _enum_visible_windows(
         self,
     ) -> list[tuple[int, str, str, str, int]]:
@@ -1437,24 +1622,13 @@ class TickerAutomationApp:
             title = get_window_text(hwnd).strip()
             if not title:
                 return True
-            pid = wintypes.DWORD(0)
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value == own_pid:
+            pid = get_hwnd_pid(hwnd)
+            if pid == own_pid:
                 return True
 
-            is_iconic = bool(user32.IsIconic(hwnd))
-            if is_iconic:
-                # Minimized windows report a tiny (-32000, -32000) 160x28 stub rect in
-                # GetWindowRect; assign a standard nominal area so they are never skipped.
-                area = 1280 * 800
-            else:
-                rect = wintypes.RECT()
-                user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                w = max(0, rect.right - rect.left)
-                h = max(0, rect.bottom - rect.top)
-                if w < 150 or h < 100:
-                    return True
-                area = w * h
+            area = self._get_restored_window_area(hwnd)
+            if area <= 0:
+                return True
 
             exe_name = get_hwnd_process_name(hwnd).lower()
             cls_name = get_window_class(hwnd).lower()
@@ -1468,7 +1642,7 @@ class TickerAutomationApp:
     def _find_bookmap_hwnd(self) -> int:
         """
         Finds the main Bookmap chart window. Excludes browser processes and
-        auxiliary/launcher Bookmap windows.
+        deprioritizes auxiliary/launcher/dialog Bookmap windows.
         """
         target_title = (
             self.config.get("bookmap_window_title", "Bookmap").strip().lower()
@@ -1487,19 +1661,46 @@ class TickerAutomationApp:
             if exe_name in browser_exes:
                 continue
             t_low = title.lower()
-            if target_title in t_low or "bookmap" in exe_name:
+            is_bm_exe = "bookmap" in exe_name
+            is_bm_title = target_title in t_low and (
+                is_bm_exe or "sunawt" in cls_name
+            )
+            if is_bm_exe or is_bm_title:
                 # Prefer main SunAwtFrame chart window over launcher/control panel or small dialogs
                 is_aux = any(
                     k in t_low
-                    for k in ("control panel", "run options", "launcher", "subscribe")
+                    for k in (
+                        "control panel",
+                        "run options",
+                        "launcher",
+                        "subscribe",
+                    )
                 ) or ("dialog" in cls_name)
-                priority = 0 if not is_aux else 1
-                candidates.append((priority, -area, hwnd, title))
+                exe_rank = 0 if is_bm_exe else 1
+                aux_rank = 0 if not is_aux else 1
+                candidates.append((exe_rank, aux_rank, -area, hwnd, title))
 
         if not candidates:
             return 0
         candidates.sort()
-        return candidates[0][2]
+        return candidates[0][3]
+
+    def _dismiss_bookmap_modal_popup_if_any(self, bm_hwnd: int) -> None:
+        """
+        If Bookmap's main chart window is currently disabled by a modal dialog/popup
+        (e.g. a leftover Subscribe or Unsubscribe confirmation dialog), focuses that
+        popup and sends Escape so Ctrl+T can open a fresh Subscribe dialog cleanly.
+        """
+        if not bm_hwnd:
+            return
+        popup_hwnd = user32.GetWindow(bm_hwnd, GW_ENABLEDPOPUP)
+        is_disabled = not bool(user32.IsWindowEnabled(bm_hwnd))
+        if (popup_hwnd and popup_hwnd != bm_hwnd) or is_disabled:
+            target = popup_hwnd if (popup_hwnd and popup_hwnd != bm_hwnd) else bm_hwnd
+            self._focus_window(target, max_attempts=6)
+            time.sleep(0.05)
+            send_escape_reliable(hold_sec=0.03)
+            time.sleep(0.12)
 
     def _find_browser_hwnd(self) -> int:
         """
@@ -1507,13 +1708,14 @@ class TickerAutomationApp:
         browser frame classes (MozillaWindowClass / Chrome_WidgetWin_1) so background
         or shadow HWNDs are ignored.
         """
-        browser_exes = {
+        browser_list = [
             b.lower()
             for b in self.config.get(
                 "browser_executables",
                 ["firefox.exe", "chrome.exe", "msedge.exe", "brave.exe"],
             )
-        }
+        ]
+        browser_exes = set(browser_list)
         title_hint = self.config.get("browser_title_hint", "").strip().lower()
 
         windows = self._enum_visible_windows()
@@ -1557,8 +1759,9 @@ class TickerAutomationApp:
     def _force_focus_single_attempt(self, hwnd: int) -> None:
         """
         Single low-level attempt to un-minimize (if iconic) and bring hwnd to the
-        foreground WITHOUT ever sending VK_MENU (Alt), which would otherwise activate
-        Java Swing's menu bar (SC_KEYMENU) in Bookmap and swallow Ctrl+T!
+        foreground WITHOUT ever sending VK_MENU (Alt) (which would activate Java
+        Swing's menu bar SC_KEYMENU in Bookmap) and WITHOUT pywinauto (which warps
+        the mouse cursor off-screen).
         """
         fg_hwnd = user32.GetForegroundWindow()
         fg_tid = (
@@ -1586,11 +1789,20 @@ class TickerAutomationApp:
             if user32.IsIconic(hwnd):
                 user32.ShowWindow(hwnd, SW_RESTORE)
                 if user32.IsIconic(hwnd):
-                    user32.SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
+                    res = ctypes.c_size_t(0)
+                    user32.SendMessageTimeoutW(
+                        hwnd,
+                        WM_SYSCOMMAND,
+                        SC_RESTORE,
+                        0,
+                        SMTO_ABORTIFHUNG,
+                        250,
+                        ctypes.byref(res),
+                    )
                 t_restore = time.perf_counter()
                 while (
                     user32.IsIconic(hwnd)
-                    and (time.perf_counter() - t_restore) < 0.20
+                    and (time.perf_counter() - t_restore) < 0.22
                 ):
                     time.sleep(0.015)
                 time.sleep(0.05)
@@ -1606,20 +1818,10 @@ class TickerAutomationApp:
             if attached_fg:
                 user32.AttachThreadInput(cur_tid, fg_tid, False)
 
-        if user32.GetForegroundWindow() != hwnd or user32.IsIconic(hwnd):
-            try:
-                app = Application(backend="win32").connect(handle=hwnd)
-                win = app.window(handle=hwnd)
-                if user32.IsIconic(hwnd):
-                    win.restore()
-                win.set_focus()
-            except Exception:
-                pass
-
     def _focus_window(self, hwnd: int, max_attempts: int = 15) -> bool:
         """
         Reliably brings target HWND to the foreground and VERIFIES that
-        GetForegroundWindow() == hwnd across up to max_attempts retries.
+        GetForegroundWindow() == hwnd and not IsIconic(hwnd) across retries.
         """
         if not hwnd:
             return False
@@ -1645,7 +1847,7 @@ class TickerAutomationApp:
         )
 
     def _wait_for_stable_foreground(
-        self, hwnd: int, settle_ms: int, max_total_ms: int = 900
+        self, hwnd: int, settle_ms: int, max_total_ms: int = 1000
     ) -> bool:
         """
         Ensures `hwnd` holds uninterrupted foreground focus for at least `settle_ms`
@@ -1653,7 +1855,7 @@ class TickerAutomationApp:
         immediately re-focuses `hwnd` and resets the settle timer.
         """
         settle_sec = max(0.06, settle_ms / 1000.0)
-        deadline = time.perf_counter() + (max_total_ms / 1000.0)
+        deadline = time.perf_counter() + (max(max_total_ms, settle_ms + 400) / 1000.0)
         stable_since = time.perf_counter()
 
         while time.perf_counter() < deadline:
@@ -1667,7 +1869,28 @@ class TickerAutomationApp:
                 return True
             time.sleep(0.025)
 
-        return user32.GetForegroundWindow() == hwnd
+        return (
+            user32.GetForegroundWindow() == hwnd
+            and not user32.IsIconic(hwnd)
+        )
+
+    def _is_bookmap_foreground(self, bm_hwnd: int, bm_pid: int) -> bool:
+        """
+        Checks if the current foreground window belongs to Bookmap (either the main
+        chart frame or Bookmap's Subscribe JDialog). Waits briefly if GetForegroundWindow()
+        is transiently NULL (0) during a window transition.
+        """
+        fg = user32.GetForegroundWindow()
+        if not fg:
+            time.sleep(0.035)
+            fg = user32.GetForegroundWindow()
+        if not fg:
+            return False
+        if fg == bm_hwnd:
+            return True
+        if bm_pid and get_hwnd_pid(fg) == bm_pid:
+            return True
+        return "bookmap" in get_hwnd_process_name(fg).lower()
 
     # --------------------------------------------------------------------------
     # Deep-Dive Automation Sequence (Step 1: Bookmap -> Step 2: DilutionTracker)
@@ -1697,39 +1920,39 @@ class TickerAutomationApp:
             ).start()
             return
 
-        ticker = self._sync_entry_to_staged_ticker()
-        if not ticker:
-            self.set_status(
-                f"{source}: No staged ticker!",
-                THEME["fg_warning"],
-            )
-            return
-
-        # Re-arm select-all in the Edit box so the next TI click or manual click overwrites cleanly
-        self._manual_edit_active = False
-        if self.edit_hwnd:
-            set_window_text(self.edit_hwnd, ticker)
-            self._last_raw_entry_text = ticker
-            user32.SendMessageW(self.edit_hwnd, EM_SETSEL, 0, -1)
-
         if not self._automation_lock.acquire(blocking=False):
             return
 
         self._is_running_sequence = True
         try:
             # 1) If a ticker was JUST staged by Trade-Ideas External Linking (<400ms ago),
-            #    wait until 400ms has elapsed since the TI burst so Trade-Ideas
-            #    External Linking to Thinkorswim and our box is 100% finished!
+            #    wait until 400ms has elapsed since the TI burst BEFORE reading/re-arming
+            #    self.edit_hwnd so an early Alt+D never truncates an active TI burst!
             settle_guard_sec = (
-                max(0, int(self.config.get("ti_settle_guard_ms", 400)))
+                max(0, _safe_int(self.config.get("ti_settle_guard_ms"), 400))
                 / 1000.0
             )
             elapsed_since_ti = time.perf_counter() - self._last_ti_burst_ts
             if 0.0 <= elapsed_since_ti < settle_guard_sec:
                 time.sleep(settle_guard_sec - elapsed_since_ti)
-                ticker = self._sync_entry_to_staged_ticker() or ticker
 
-            # 2) Wait until physical Alt, D, and Left Mouse Button are fully released
+            ticker = self._sync_entry_to_staged_ticker()
+            if not ticker:
+                self.set_status(
+                    f"{source}: No staged ticker!",
+                    THEME["fg_warning"],
+                )
+                return
+
+            # Re-arm select-all in the Edit box so the next TI click or manual click overwrites cleanly
+            self._manual_edit_active = False
+            self._unselected_idle_prefix = ""
+            if self.edit_hwnd:
+                set_window_text(self.edit_hwnd, ticker)
+                self._last_raw_entry_text = ticker
+                user32.SendMessageW(self.edit_hwnd, EM_SETSEL, 0, -1)
+
+            # 2) Wait until physical Alt, Ctrl, Shift, D, and Left Mouse Button are fully released
             wait_for_input_settled(release_alt=release_alt, max_wait_sec=0.60)
 
             # ==================================================================
@@ -1742,80 +1965,121 @@ class TickerAutomationApp:
                     THEME["fg_warning"],
                 )
                 bm_hwnd = self._find_bookmap_hwnd()
+                bm_pid = get_hwnd_pid(bm_hwnd) if bm_hwnd else 0
+                bm_was_minimized = bool(bm_hwnd and user32.IsIconic(bm_hwnd))
+
+                if bm_hwnd:
+                    self._dismiss_bookmap_modal_popup_if_any(bm_hwnd)
+
                 if bm_hwnd and self._focus_window(bm_hwnd, max_attempts=15):
-                    bm_focus_ms = int(
-                        self.config.get("bookmap_focus_delay_ms", 220)
+                    bm_focus_ms = _safe_int(
+                        self.config.get("bookmap_focus_delay_ms"), 220, 50, 5000
                     )
-                    # Ensure Bookmap holds uninterrupted foreground focus for the full bm_focus_ms
-                    self._wait_for_stable_foreground(
-                        bm_hwnd, settle_ms=bm_focus_ms, max_total_ms=900
+                    effective_bm_settle = (
+                        max(320, bm_focus_ms + 120)
+                        if bm_was_minimized
+                        else bm_focus_ms
                     )
-
-                    wait_for_input_settled(
-                        release_alt=release_alt, max_wait_sec=0.15
+                    # Ensure Bookmap holds uninterrupted foreground focus across effective_bm_settle
+                    bm_stable = self._wait_for_stable_foreground(
+                        bm_hwnd,
+                        settle_ms=effective_bm_settle,
+                        max_total_ms=1000,
                     )
-
-                    # Send Ctrl+T with hardware scan codes and 40ms hold to open Subscribe dialog
-                    send_ctrl_key_reliable("t", hold_sec=0.04)
-
-                    bm_dialog_ms = int(
-                        self.config.get("bookmap_dialog_delay_ms", 280)
-                    )
-                    time.sleep(max(100, bm_dialog_ms) / 1000.0)
-
-                    # Verify a Bookmap window (main chart or Subscribe dialog) is still foreground;
-                    # if another process stole focus during Ctrl+T, re-focus Bookmap and retry Ctrl+T!
-                    fg_now = user32.GetForegroundWindow()
-                    if "bookmap" not in get_hwnd_process_name(fg_now).lower():
-                        self._focus_window(bm_hwnd, max_attempts=12)
-                        self._wait_for_stable_foreground(
-                            bm_hwnd, settle_ms=180, max_total_ms=600
+                    if not bm_stable and not self._is_bookmap_foreground(bm_hwnd, bm_pid):
+                        if skip_browser:
+                            self.set_status(
+                                f"[{ticker}] Could not focus Bookmap!",
+                                THEME["fg_error"],
+                            )
+                            return
+                    else:
+                        # Wait for any physical modifier/mouse activity WITHOUT sending Alt key-ups
+                        wait_for_input_settled(
+                            release_alt=False, max_wait_sec=0.15
                         )
+
+                        # Copy ticker to clipboard before Ctrl+T
+                        pyperclip.copy(ticker)
+
+                        # Send Ctrl+T with hardware scan codes and 40ms hold to open Subscribe dialog
                         send_ctrl_key_reliable("t", hold_sec=0.04)
+
+                        bm_dialog_ms = _safe_int(
+                            self.config.get("bookmap_dialog_delay_ms"),
+                            280,
+                            50,
+                            5000,
+                        )
                         time.sleep(max(100, bm_dialog_ms) / 1000.0)
 
-                    rect = wintypes.RECT()
-                    user32.GetWindowRect(bm_hwnd, ctypes.byref(rect))
-                    if self.config.get("bookmap_use_symbol_click", False):
-                        rel_x = int(self.config.get("bookmap_symbol_rel_x", 0))
-                        rel_y = int(self.config.get("bookmap_symbol_rel_y", 0))
-                        if rel_x > 0 or rel_y > 0:
-                            pyautogui.click(
-                                rect.left + rel_x, rect.top + rel_y
+                        # Verify a Bookmap window (main chart or Subscribe dialog) is still foreground;
+                        # if another process stole focus during Ctrl+T, re-focus Bookmap and retry Ctrl+T!
+                        if not self._is_bookmap_foreground(bm_hwnd, bm_pid):
+                            self._focus_window(bm_hwnd, max_attempts=12)
+                            self._wait_for_stable_foreground(
+                                bm_hwnd, settle_ms=180, max_total_ms=600
                             )
-                            time.sleep(0.05)
+                            send_ctrl_key_reliable("t", hold_sec=0.04)
+                            time.sleep(max(100, bm_dialog_ms) / 1000.0)
 
-                    # Copy ticker right before pasting so nothing can overwrite the clipboard
-                    pyperclip.copy(ticker)
-                    time.sleep(0.025)
+                        if self._is_bookmap_foreground(bm_hwnd, bm_pid):
+                            rect = wintypes.RECT()
+                            user32.GetWindowRect(bm_hwnd, ctypes.byref(rect))
+                            if self.config.get("bookmap_use_symbol_click", False):
+                                rel_x = _safe_int(
+                                    self.config.get("bookmap_symbol_rel_x"), 0
+                                )
+                                rel_y = _safe_int(
+                                    self.config.get("bookmap_symbol_rel_y"), 0
+                                )
+                                if rel_x != 0 or rel_y != 0:
+                                    pyautogui.click(
+                                        rect.left + rel_x, rect.top + rel_y
+                                    )
+                                    time.sleep(0.05)
 
-                    send_ctrl_key_reliable("a", hold_sec=0.03)
-                    time.sleep(0.035)
-                    send_ctrl_key_reliable("v", hold_sec=0.035)
-                    time.sleep(0.07)
+                            # Re-verify clipboard right before pasting so nothing overwrote it
+                            pyperclip.copy(ticker)
+                            time.sleep(0.025)
 
-                    if self.config.get("bookmap_use_subscribe_click", False):
-                        sub_x = int(
-                            self.config.get("bookmap_subscribe_rel_x", 0)
-                        )
-                        sub_y = int(
-                            self.config.get("bookmap_subscribe_rel_y", 0)
-                        )
-                        if sub_x > 0 or sub_y > 0:
-                            pyautogui.click(
-                                rect.left + sub_x, rect.top + sub_y
+                            send_ctrl_key_reliable("a", hold_sec=0.03)
+                            time.sleep(0.035)
+                            send_ctrl_key_reliable("v", hold_sec=0.035)
+                            time.sleep(0.07)
+
+                            if self.config.get(
+                                "bookmap_use_subscribe_click", False
+                            ):
+                                sub_x = _safe_int(
+                                    self.config.get("bookmap_subscribe_rel_x"),
+                                    0,
+                                )
+                                sub_y = _safe_int(
+                                    self.config.get("bookmap_subscribe_rel_y"),
+                                    0,
+                                )
+                                if sub_x != 0 or sub_y != 0:
+                                    pyautogui.click(
+                                        rect.left + sub_x, rect.top + sub_y
+                                    )
+                                    time.sleep(0.04)
+
+                            send_enter_reliable(hold_sec=0.04)
+                            time.sleep(0.10)
+
+                            if skip_browser:
+                                self.set_status(
+                                    f"BM Complete: {ticker} ({source})",
+                                    THEME["fg_success"],
+                                )
+                                return
+                        elif skip_browser:
+                            self.set_status(
+                                f"[{ticker}] Bookmap focus stolen during Ctrl+T!",
+                                THEME["fg_error"],
                             )
-                            time.sleep(0.04)
-
-                    send_enter_reliable(hold_sec=0.04)
-                    time.sleep(0.10)
-
-                    if skip_browser:
-                        self.set_status(
-                            f"BM Complete: {ticker} ({source})",
-                            THEME["fg_success"],
-                        )
-                        return
+                            return
                 else:
                     if skip_browser:
                         self.set_status(
@@ -1830,15 +2094,15 @@ class TickerAutomationApp:
                     time.sleep(0.10)
 
                 # Wait for Bookmap's Subscribe dialog to finish closing and releasing focus
-                trans_ms = int(self.config.get("step_transition_delay_ms", 250))
+                trans_ms = _safe_int(
+                    self.config.get("step_transition_delay_ms"), 250, 50, 5000
+                )
                 time.sleep(max(100, trans_ms) / 1000.0)
 
             # ==================================================================
             # STEP 2: DILUTIONTRACKER PINNED TAB AUTOMATION
             # ==================================================================
-            tab_idx = max(
-                1, min(8, int(self.config.get("pinned_tab_index", 6)))
-            )
+            tab_idx = _safe_int(self.config.get("pinned_tab_index"), 6, 1, 8)
             step_label = "DT Only" if skip_bookmap else "Step 2/2"
             self.set_status(
                 f"[{ticker}] {step_label}: Browser Ctrl+{tab_idx} -> DilutionTracker...",
@@ -1850,31 +2114,48 @@ class TickerAutomationApp:
                 browser_hwnd and user32.IsIconic(browser_hwnd)
             )
             if browser_hwnd and self._focus_window(browser_hwnd, max_attempts=15):
-                br_focus_ms = int(
-                    self.config.get("browser_focus_delay_ms", 120)
+                br_focus_ms = _safe_int(
+                    self.config.get("browser_focus_delay_ms"), 120, 20, 5000
                 )
-                if br_was_minimized:
-                    # Give the browser extra time to finish restoring from minimized state
-                    self._wait_for_stable_foreground(
-                        browser_hwnd,
-                        settle_ms=max(240, br_focus_ms + 120),
-                        max_total_ms=900,
-                    )
-                else:
-                    time.sleep(max(40, br_focus_ms) / 1000.0)
+                effective_br_settle = (
+                    max(240, br_focus_ms + 120)
+                    if br_was_minimized
+                    else max(60, br_focus_ms)
+                )
+                self._wait_for_stable_foreground(
+                    browser_hwnd,
+                    settle_ms=effective_br_settle,
+                    max_total_ms=900,
+                )
 
                 if user32.GetForegroundWindow() != browser_hwnd:
                     self._focus_window(browser_hwnd, max_attempts=8)
                     time.sleep(0.06)
 
+                if user32.GetForegroundWindow() != browser_hwnd:
+                    self.set_status(
+                        f"[{ticker}] Browser focus lost before tab switch!",
+                        THEME["fg_error"],
+                    )
+                    return
+
                 send_ctrl_key_reliable(str(tab_idx), hold_sec=0.03)
 
-                br_tab_ms = int(self.config.get("browser_tab_delay_ms", 120))
+                br_tab_ms = _safe_int(
+                    self.config.get("browser_tab_delay_ms"), 120, 20, 5000
+                )
                 time.sleep(max(40, br_tab_ms) / 1000.0)
 
                 if user32.GetForegroundWindow() != browser_hwnd:
                     self._focus_window(browser_hwnd, max_attempts=6)
                     time.sleep(0.04)
+
+                if user32.GetForegroundWindow() != browser_hwnd:
+                    self.set_status(
+                        f"[{ticker}] Browser focus lost before URL paste!",
+                        THEME["fg_error"],
+                    )
+                    return
 
                 url_tmpl = self.config.get(
                     "dilution_tracker_url_template",
@@ -1886,7 +2167,9 @@ class TickerAutomationApp:
                 pyperclip.copy(target_url)
 
                 send_ctrl_key_reliable("l", hold_sec=0.03)
-                br_url_ms = int(self.config.get("browser_url_delay_ms", 100))
+                br_url_ms = _safe_int(
+                    self.config.get("browser_url_delay_ms"), 100, 20, 5000
+                )
                 time.sleep(max(40, br_url_ms) / 1000.0)
 
                 send_ctrl_key_reliable("v", hold_sec=0.03)
@@ -1932,12 +2215,23 @@ class TickerAutomationApp:
         except Exception:
             pass
 
+        try:
+            if self._edit_font:
+                gdi32.DeleteObject(self._edit_font)
+                self._edit_font = 0
+        except Exception:
+            pass
+
         self.root.destroy()
 
 
 def main() -> None:
     sys.excepthook = lambda exc_type, exc_val, exc_tb: log_error(
         "Uncaught exception", exc_val
+    )
+    threading.excepthook = lambda args: log_error(
+        f"Unhandled thread exception in {getattr(args.thread, 'name', 'thread')}",
+        args.exc_value,
     )
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -1950,6 +2244,9 @@ def main() -> None:
     close_previous_instances()
 
     root = tk.Tk()
+    root.report_callback_exception = lambda exc_type, exc_val, exc_tb: log_error(
+        "Tkinter callback exception", exc_val
+    )
     app = TickerAutomationApp(root)
     root.mainloop()
 

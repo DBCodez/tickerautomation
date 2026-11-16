@@ -19,3 +19,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
    Write-Host 'Created Admin Desktop Shortcut:' $ShortcutPath -ForegroundColor Green"
 
 pause
+
