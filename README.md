@@ -9,10 +9,14 @@ A lightweight, always-on-top dark-mode Windows utility that links with **Trade-I
   - Exposes a native Win32 `Edit` box targetable by Trade-Ideas External Linking (`Crosshairs`).
   - Single-clicking any ticker in Trade-Ideas silently stages the symbol (`Staged: XXXX`) with zero Windows system beep.
   - Also supports clicking directly into the `TI LINK:` box to type any ticker manually.
-- **Instant Deep-Dive Trigger (`Alt+D` or GUI Button):**
-  - Press **`Alt+D`** globally or click **`🚀 Deep-Dive (Alt+D)`** to run the 2-step sequence:
-    1. **Step 1 — Bookmap:** Focuses the main Bookmap chart window, sends `Ctrl+T` to open the Subscribe dialog, pastes the staged ticker, and presses `Enter`.
-    2. **Step 2 — DilutionTracker:** Focuses your browser window, switches to your configured pinned DilutionTracker tab (`Ctrl+1` through `Ctrl+8`, default `Ctrl+6`), focuses the address bar (`Ctrl+L`), pastes `https://dilutiontracker.com/app/search/{ticker}`, and presses `Enter`.
+- **Reverse Thinkorswim -> Deep-Dive Grab (`📥 TOS` or `Alt+G`):**
+  - **2-Pass Live-Trading-Safe Pull** (never sends `Ctrl+C` or letter keys to TOS):
+    1. **Clicked Symbol Box (Thumbnails or Main Chart):** Click directly inside any TOS `[ TICKER ]` box and hit **`Alt+G`** to stage it with zero synthetic mouse clicks.
+    2. **Main Chart Fallback:** Calibrate your main TOS chart's symbol box once in **`⚙ -> 🎯 Pick (3s)`** to grab its active ticker via **`Alt+G`** or **`📥 TOS`** from anywhere (even when TOS is minimized).
+- **Instant Deep-Dive Triggers (`Alt+D`, `📊 BM`, `🌐 DT`):**
+  - Press **`Alt+D`** globally or click **`🚀 Deep-Dive (Alt+D)`** to run both steps (or **`📊 BM`** / **`🌐 DT`** to run either step individually):
+    1. **Step 1 — Bookmap:** Restores if minimized, focuses the main Bookmap chart window, sends `Ctrl+T` to open the Subscribe dialog, pastes the staged ticker, and presses `Enter`.
+    2. **Step 2 — DilutionTracker:** Restores if minimized, focuses your browser window, switches to your configured pinned DilutionTracker tab (`Ctrl+1` through `Ctrl+8`, default `Ctrl+6`), focuses the address bar (`Ctrl+L`), pastes `https://dilutiontracker.com/app/search/{ticker}`, and presses `Enter`.
 - **Persistent Configuration (`config.json`):**
   - Stores your pinned tab number, window position, always-on-top preference, delays, and optional Bookmap fallback relative coordinates.
 

@@ -1,27 +1,23 @@
 """
-Trade-Ideas -> Bookmap & DilutionTracker Deep-Dive Automation Utility (v2.2)
-============================================================================
+Trade-Ideas <-> Thinkorswim, Bookmap & DilutionTracker Deep-Dive Utility (v2.3)
+===============================================================================
 A lightweight, always-on-top dark-mode Windows background utility that:
 1. Exposes a native Win32 "Edit" control targetable by Trade-Ideas External Linking
    AND directly editable by hand (click the TI LINK box and type any ticker).
 2. Silently stages tickers on single-click or manual typing (Staged: XXXX) without
    triggering automation and without any Windows system beep
    (via ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL).
-3. Triggers the Deep-Dive sequence when:
+3. Reverse Thinkorswim -> Deep-Dive Grab ("TOS" button or Alt+G global hotkey):
+   - 2-Pass live-trading-safe ticker pull (ZERO Ctrl+C or letter keys sent to TOS):
+     * Pass 1: Zero-click Ctrl+Insert copy from any symbol box just clicked in TOS
+       (works across 8-chart thumbnail grids AND main chart).
+     * Pass 2: Calibrated Main Chart symbol box fallback with strict title, size,
+       maximize, DPI, popup, and BlockInput hardware-input guards.
+4. Triggers the Deep-Dive sequence when:
    - The global hotkey (Alt+D) is pressed at any time, OR
    - The GUI buttons ("🚀 Deep-Dive (Alt+D)", "📊 BM", or "🌐 DT") are clicked.
-4. Step 1 (Bookmap):
-   - Waits for any active Trade-Ideas External Linking macro (to our box and Thinkorswim)
-     to finish settling, and waits for physical modifier / mouse button release.
-   - Dismisses any stale modal popup blocking Bookmap, restores Bookmap if minimized,
-     and focuses the main Bookmap chart window WITHOUT ever tapping VK_MENU (Alt)
-     so Bookmap's Java Swing menu bar (SC_KEYMENU) is never activated.
-   - Verifies Bookmap holds uninterrupted foreground focus across bookmap_focus_delay_ms
-     before sending Ctrl+T, Ctrl+A, Ctrl+V, and Enter with hardware scan codes.
-5. Step 2 (DilutionTracker):
-   - Restores (if minimized) and focuses the main browser window -> Ctrl+<1-8>
-     (default Ctrl+6) -> Ctrl+L -> pastes https://dilutiontracker.com/app/search/{ticker}
-     -> Enter.
+5. Step 1 (Bookmap) & Step 2 (DilutionTracker) with verified foreground focus and
+   universal TOS foreground protection on all Ctrl+<letter/digit> senders.
 6. Persists all settings atomically to config.json with multi-monitor bounds validation.
 """
 
@@ -32,6 +28,7 @@ import json
 import time
 import ctypes
 from ctypes import wintypes
+from contextlib import contextmanager
 import traceback
 import threading
 import tkinter as tk
@@ -41,7 +38,7 @@ import pyperclip
 import pyautogui
 from pynput import keyboard
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 CONFIG_SCHEMA_VERSION = 2
 
 # Disable PyAutoGUI's default 100ms post-action pause so we control exact millisecond delays
@@ -90,6 +87,13 @@ DEFAULT_CONFIG = {
     "config_schema_version": CONFIG_SCHEMA_VERSION,
     "pinned_tab_index": 6,
     "hotkey": "<alt>+d",
+    "tos_grab_hotkey": "<alt>+g",
+    "tos_symbol_rel_x": 0,
+    "tos_symbol_rel_y": 0,
+    "tos_window_title": "",
+    "tos_window_rect": None,
+    "tos_window_maximized": None,
+    "tos_window_dpi": 0,
     "ti_settle_guard_ms": 400,
     "bookmap_window_title": "Bookmap",
     "bookmap_focus_delay_ms": 220,
@@ -133,6 +137,8 @@ THEME = {
     "bg_button_hover": "#30363D",
     "bg_accent": "#238636",
     "bg_accent_hover": "#2EA043",
+    "bg_tos_btn": "#0E7490",
+    "bg_tos_btn_hover": "#0891B2",
     "bg_bm_btn": "#8957E5",
     "bg_bm_btn_hover": "#A371F7",
     "bg_dt_btn": "#1F6FEB",
@@ -148,12 +154,14 @@ THEME = {
 }
 
 # ==============================================================================
-# 2. WIN32 API DEFINITIONS (64-BIT SAFE, NO PYTHON WNDPROC HOOKS)
+# 2. WIN32 API DEFINITIONS (64-BIT SAFE, ISOLATED FROM PYNPUT'S ctypes.windll)
 # ==============================================================================
-user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
-kernel32 = ctypes.windll.kernel32
-dwmapi = ctypes.windll.dwmapi
+# Use private ctypes.WinDLL instances (NOT ctypes.windll.user32 singleton!) so our
+# explicit argtypes (e.g. GetMessageW) NEVER collide with pynput's internal Win32 types.
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(
     wintypes.BOOL,
@@ -186,11 +194,25 @@ ES_WANTRETURN = 0x1000
 
 WM_SETTEXT = 0x000C
 WM_CLOSE = 0x0010
+WM_QUIT = 0x0012
 WM_SETFONT = 0x0030
 WM_SYSCOMMAND = 0x0112
+WM_HOTKEY = 0x0312
 SC_RESTORE = 0xF120
 EM_GETSEL = 0x00B0
 EM_SETSEL = 0x00B1
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+HOTKEY_ID_TOS_GRAB = 101
+ERROR_HOTKEY_ALREADY_REGISTERED = 1409
+
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_ssize_t(-4)
 
 SMTO_ABORTIFHUNG = 0x0002
 GW_ENABLEDPOPUP = 6
@@ -202,10 +224,15 @@ VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_MENU = 0x12   # Alt key
 VK_ESCAPE = 0x1B
+VK_END = 0x23
+VK_HOME = 0x24
+VK_INSERT = 0x2D
 VK_LMENU = 0xA4  # Left Alt
 VK_RMENU = 0xA5  # Right Alt
 VK_D = 0x44
+VK_G = 0x47
 
+KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
 
@@ -405,6 +432,131 @@ kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
+
+user32.IsZoomed.argtypes = [wintypes.HWND]
+user32.IsZoomed.restype = wintypes.BOOL
+
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.SetCursorPos.restype = wintypes.BOOL
+
+user32.BlockInput.argtypes = [wintypes.BOOL]
+user32.BlockInput.restype = wintypes.BOOL
+
+user32.RegisterHotKey.argtypes = [
+    wintypes.HWND,
+    ctypes.c_int,
+    wintypes.UINT,
+    wintypes.UINT,
+]
+user32.RegisterHotKey.restype = wintypes.BOOL
+
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+
+user32.GetMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG),
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.UINT,
+]
+user32.GetMessageW.restype = ctypes.c_int
+
+user32.PostThreadMessageW.argtypes = [
+    wintypes.DWORD,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+
+user32.GetClipboardSequenceNumber.argtypes = []
+user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+
+user32.GetClipboardOwner.argtypes = []
+user32.GetClipboardOwner.restype = wintypes.HWND
+
+user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+
+user32.OpenClipboard.argtypes = [wintypes.HWND]
+user32.OpenClipboard.restype = wintypes.BOOL
+
+user32.CloseClipboard.argtypes = []
+user32.CloseClipboard.restype = wintypes.BOOL
+
+user32.EmptyClipboard.argtypes = []
+user32.EmptyClipboard.restype = wintypes.BOOL
+
+user32.GetClipboardData.argtypes = [wintypes.UINT]
+user32.GetClipboardData.restype = wintypes.HANDLE
+
+user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+user32.SetClipboardData.restype = wintypes.HANDLE
+
+kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+
+kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalLock.restype = wintypes.LPVOID
+
+kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalUnlock.restype = wintypes.BOOL
+
+kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalSize.restype = ctypes.c_size_t
+
+kernel32.GetLastError.argtypes = []
+kernel32.GetLastError.restype = wintypes.DWORD
+
+_GetDpiForWindow = getattr(user32, "GetDpiForWindow", None)
+if _GetDpiForWindow is not None:
+    _GetDpiForWindow.argtypes = [wintypes.HWND]
+    _GetDpiForWindow.restype = wintypes.UINT
+
+_SetThreadDpiAwarenessContext = getattr(
+    user32, "SetThreadDpiAwarenessContext", None
+)
+if _SetThreadDpiAwarenessContext is not None:
+    _SetThreadDpiAwarenessContext.argtypes = [ctypes.c_ssize_t]
+    _SetThreadDpiAwarenessContext.restype = ctypes.c_ssize_t
+
+
+@contextmanager
+def per_monitor_dpi_context():
+    """Temporarily switches the calling thread to Per-Monitor v2 DPI awareness for physical-pixel accuracy."""
+    prev = 0
+    if _SetThreadDpiAwarenessContext is not None:
+        try:
+            prev = _SetThreadDpiAwarenessContext(
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+            )
+        except Exception:
+            prev = 0
+    try:
+        yield
+    finally:
+        if prev and _SetThreadDpiAwarenessContext is not None:
+            try:
+                _SetThreadDpiAwarenessContext(prev)
+            except Exception:
+                pass
+
+
+def get_window_dpi(hwnd: int) -> int:
+    if hwnd and _GetDpiForWindow is not None:
+        try:
+            dpi = int(_GetDpiForWindow(hwnd))
+            if dpi > 0:
+                return dpi
+        except Exception:
+            pass
+    return 96
+
 
 def clean_ticker(raw_text: str) -> str:
     """Clean raw text from Trade-Ideas External Linking or manual typing into a valid ticker symbol."""
@@ -425,6 +577,34 @@ def clean_ticker(raw_text: str) -> str:
     return cleaned[:12]
 
 
+_TOS_TICKER_RE = re.compile(r"^([A-Za-z]{1,5})(?:([./\-])([A-Za-z]{1,2}))?$")
+
+
+def parse_tos_ticker(raw_text: str) -> str:
+    """
+    Strictly validates a single equity/ETF/index ticker copied from a Thinkorswim
+    symbol box. Rejects empty/'0' slots, prices/quantities, multi-column table rows,
+    futures ('/ES'), and options ('.AAPL...'). Normalizes 'BRK/B' -> 'BRK.B'.
+    """
+    if not raw_text:
+        return ""
+    s = raw_text.strip()
+    if not s or len(s) > 12 or re.search(r"\s", s):
+        return ""
+    if s.startswith("$"):
+        s = s[1:]
+    m = _TOS_TICKER_RE.match(s)
+    if not m:
+        return ""
+    root_sym = m.group(1).upper()
+    sep = m.group(2)
+    suffix = m.group(3).upper() if m.group(3) else ""
+    if sep and suffix:
+        norm_sep = "." if sep == "/" else sep
+        return f"{root_sym}{norm_sep}{suffix}"
+    return root_sym
+
+
 def get_hwnd_pid(hwnd: int) -> int:
     if not hwnd:
         return 0
@@ -433,19 +613,12 @@ def get_hwnd_pid(hwnd: int) -> int:
     return int(pid.value)
 
 
-def get_hwnd_process_info(hwnd: int) -> tuple[str, str, int]:
-    """
-    Fast Win32 lookup returning (exe_basename_lower, full_exe_path_lower, pid) for an HWND.
-    """
-    if not hwnd:
-        return "", "", 0
-    pid = wintypes.DWORD(0)
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    if not pid.value:
-        return "", "", 0
-
+def get_pid_process_info(pid_val: int) -> tuple[str, str]:
+    """Returns (exe_basename_lower, full_exe_path_lower) for a PID."""
+    if not pid_val:
+        return "", ""
     hproc = kernel32.OpenProcess(
-        PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid_val
     )
     if hproc:
         try:
@@ -455,22 +628,80 @@ def get_hwnd_process_info(hwnd: int) -> tuple[str, str, int]:
                 hproc, 0, buf, ctypes.byref(buf_len)
             ):
                 full_path = buf.value.lower()
-                return os.path.basename(full_path), full_path, int(pid.value)
+                return os.path.basename(full_path), full_path
         finally:
             kernel32.CloseHandle(hproc)
 
     try:
-        proc = psutil.Process(pid.value)
+        proc = psutil.Process(pid_val)
         name = (proc.name() or "").lower()
         exe = (proc.exe() or "").lower()
-        return name, exe, int(pid.value)
+        return name, exe
     except Exception:
-        return "", "", int(pid.value)
+        return "", ""
+
+
+def get_hwnd_process_info(hwnd: int) -> tuple[str, str, int]:
+    """
+    Fast Win32 lookup returning (exe_basename_lower, full_exe_path_lower, pid) for an HWND.
+    """
+    pid_val = get_hwnd_pid(hwnd)
+    if not pid_val:
+        return "", "", 0
+    name, full_path = get_pid_process_info(pid_val)
+    return name, full_path, pid_val
 
 
 def get_hwnd_process_name(hwnd: int) -> str:
     name, _, _ = get_hwnd_process_info(hwnd)
     return name
+
+
+_PID_TOS_CACHE: dict[int, tuple[float, bool]] = {}
+_PID_TOS_CACHE_LOCK = threading.Lock()
+
+
+def is_tos_pid(pid_val: int) -> bool:
+    """Cached check returning True iff `pid_val` belongs to Thinkorswim (and never Bookmap)."""
+    if not pid_val:
+        return False
+    now = time.monotonic()
+    with _PID_TOS_CACHE_LOCK:
+        cached = _PID_TOS_CACHE.get(pid_val)
+        if cached is not None and (now - cached[0]) < 30.0:
+            return cached[1]
+
+    exe_name, full_path = get_pid_process_info(pid_val)
+    is_tos = (
+        ("thinkorswim" in exe_name or "thinkorswim" in full_path)
+        and "bookmap" not in exe_name
+    )
+    with _PID_TOS_CACHE_LOCK:
+        if len(_PID_TOS_CACHE) > 256:
+            _PID_TOS_CACHE.clear()
+        _PID_TOS_CACHE[pid_val] = (now, is_tos)
+    return is_tos
+
+
+def is_tos_process_hwnd(hwnd: int) -> bool:
+    """Returns True if `hwnd` belongs to the Thinkorswim process (frame, dialog, or popup)."""
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+    return is_tos_pid(get_hwnd_pid(hwnd))
+
+
+def is_tos_frame_hwnd(hwnd: int) -> bool:
+    """Returns True strictly for top-level Thinkorswim `SunAwtFrame` windows (excludes dialogs/modals)."""
+    if not is_tos_process_hwnd(hwnd):
+        return False
+    return get_window_class(hwnd).lower() == "sunawtframe"
+
+
+def normalize_tos_title(title: str) -> str:
+    """Strips Thinkorswim's dynamic ` [build ...]` suffix for stable cross-update window matching."""
+    if not title:
+        return ""
+    return re.sub(r"\s*\[build[^\]]*\]\s*$", "", title.strip(), flags=re.IGNORECASE)
 
 
 def get_window_text(hwnd: int) -> str:
@@ -502,6 +733,157 @@ def set_window_text(hwnd: int, text: str) -> None:
     user32.SendMessageW(
         hwnd, WM_SETTEXT, 0, ctypes.cast(buf, ctypes.c_void_p).value
     )
+
+
+def read_clipboard_unicode_with_owner(
+    max_bytes: int = 512, retries: int = 4
+) -> tuple[bool, str | None, int]:
+    """
+    Bounded pure-Win32 clipboard reader returning (opened_ok, unicode_text_or_none, owner_pid).
+    Checks GlobalSize BEFORE copying memory so large clipboard payloads are skipped in O(1).
+    """
+    owner_hwnd = user32.GetClipboardOwner()
+    owner_pid = get_hwnd_pid(owner_hwnd) if owner_hwnd else 0
+
+    if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+        return True, None, owner_pid
+
+    opened = False
+    for attempt in range(max(1, retries)):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        if attempt + 1 < retries:
+            time.sleep(0.012)
+
+    if not opened:
+        return False, None, owner_pid
+
+    try:
+        h_data = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h_data:
+            return True, None, owner_pid
+        byte_size = int(kernel32.GlobalSize(h_data))
+        if byte_size <= 0 or byte_size > max_bytes:
+            return True, None, owner_pid
+        ptr = kernel32.GlobalLock(h_data)
+        if not ptr:
+            return True, None, owner_pid
+        try:
+            max_wchars = byte_size // 2
+            raw_w = ctypes.wstring_at(ptr, max_wchars)
+            return True, raw_w.split("\x00", 1)[0], owner_pid
+        finally:
+            kernel32.GlobalUnlock(h_data)
+    finally:
+        user32.CloseClipboard()
+
+
+def write_clipboard_unicode(text: str, retries: int = 4) -> bool:
+    """
+    Pure-Win32 clipboard writer. When `text == ""`, empties clipboard cleanly so
+    subsequent `CF_UNICODETEXT` writes from Thinkorswim are unambiguous.
+    """
+    opened = False
+    for attempt in range(max(1, retries)):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        if attempt + 1 < retries:
+            time.sleep(0.012)
+    if not opened:
+        return False
+
+    try:
+        user32.EmptyClipboard()
+        if not text:
+            return True
+        utf16 = (text + "\x00").encode("utf-16-le")
+        h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(utf16))
+        if not h_mem:
+            return False
+        ptr = kernel32.GlobalLock(h_mem)
+        if not ptr:
+            kernel32.GlobalFree(h_mem)
+            return False
+        try:
+            ctypes.memmove(ptr, utf16, len(utf16))
+        finally:
+            kernel32.GlobalUnlock(h_mem)
+        if not user32.SetClipboardData(CF_UNICODETEXT, h_mem):
+            kernel32.GlobalFree(h_mem)
+            return False
+        return True
+    finally:
+        user32.CloseClipboard()
+
+
+def wait_for_clipboard_quiet(quiet_ms: int = 150, max_wait_ms: int = 450) -> None:
+    """Waits until GetClipboardSequenceNumber() remains unchanged for `quiet_ms`."""
+    quiet_sec = quiet_ms / 1000.0
+    deadline = time.perf_counter() + (max_wait_ms / 1000.0)
+    last_seq = user32.GetClipboardSequenceNumber()
+    stable_since = time.perf_counter()
+    while time.perf_counter() < deadline:
+        cur_seq = user32.GetClipboardSequenceNumber()
+        if cur_seq != last_seq:
+            last_seq = cur_seq
+            stable_since = time.perf_counter()
+        elif (time.perf_counter() - stable_since) >= quiet_sec:
+            return
+        time.sleep(0.015)
+
+
+_HOTKEY_NAME_TO_VK: dict[str, int] = {
+    **{chr(c): c for c in range(ord("A"), ord("Z") + 1)},
+    **{str(d): ord(str(d)) for d in range(0, 10)},
+    **{f"F{i}": 0x6F + i for i in range(1, 25)},
+    "INSERT": VK_INSERT,
+    "HOME": VK_HOME,
+    "END": VK_END,
+}
+
+
+def parse_win32_hotkey(hotkey_str: str) -> tuple[int, int, list[int], str] | None:
+    """
+    Parses a hotkey string like '<alt>+g', 'alt+g', '<ctrl>+<shift>+g', or 'f9'
+    into (win32_mod_flags, vk_code, extra_vks_to_settle, display_label).
+    """
+    if not hotkey_str or not hotkey_str.strip():
+        return None
+    parts = [
+        p.strip().strip("<>").upper()
+        for p in hotkey_str.strip().split("+")
+        if p.strip()
+    ]
+    if not parts:
+        return None
+
+    mods = MOD_NOREPEAT
+    key_vk = 0
+    disp_parts = []
+    for token in parts:
+        if token in ("ALT", "MENU"):
+            mods |= MOD_ALT
+            disp_parts.append("Alt")
+        elif token in ("CTRL", "CONTROL"):
+            mods |= MOD_CONTROL
+            disp_parts.append("Ctrl")
+        elif token == "SHIFT":
+            mods |= MOD_SHIFT
+            disp_parts.append("Shift")
+        elif token in ("WIN", "SUPER", "CMD"):
+            mods |= MOD_WIN
+            disp_parts.append("Win")
+        elif token in _HOTKEY_NAME_TO_VK and key_vk == 0:
+            key_vk = _HOTKEY_NAME_TO_VK[token]
+            disp_parts.append(token.capitalize() if len(token) > 1 else token)
+        else:
+            return None
+
+    if key_vk == 0:
+        return None
+    return mods, key_vk, [key_vk], "+".join(disp_parts)
 
 
 def apply_dark_titlebar(hwnd: int) -> None:
@@ -551,17 +933,38 @@ def _vk_key_event(vk: int, key_up: bool = False) -> None:
     user32.keybd_event(vk & 0xFF, scan, flags, 0)
 
 
+def _vk_key_event_ext(vk: int, key_up: bool = False) -> None:
+    """Send an extended navigation key event (Home, End, Insert) so Java Swing never treats it as Numpad."""
+    scan = user32.MapVirtualKeyW(vk, 0) & 0xFF
+    flags = KEYEVENTF_EXTENDEDKEY | (KEYEVENTF_KEYUP if key_up else 0)
+    user32.keybd_event(vk & 0xFF, scan, flags, 0)
+
+
 def send_ctrl_key_reliable(key_char: str, hold_sec: float = 0.04) -> None:
     """
     Sends Ctrl+<key_char> using Win32 virtual keys + hardware scan codes and explicit
-    hold durations on BOTH Ctrl and the target key. Uses try/finally so VK_CONTROL
-    can never be left stuck down if interrupted.
+    hold durations on BOTH Ctrl and the target key.
+    LIVE-TRADING SAFETY GUARD: Refuses to fire if Thinkorswim owns the foreground window
+    (since Ctrl+<letter> combos such as Ctrl+C can be bound to live order actions in TOS).
     """
     ch = key_char.upper()
     vk = ord(ch[0])
+    fg_pre = user32.GetForegroundWindow()
+    if fg_pre and is_tos_process_hwnd(fg_pre):
+        log_error(
+            f"Safety guard blocked send_ctrl_key_reliable({ch!r}): Thinkorswim owns foreground HWND {hex(fg_pre)}"
+        )
+        raise RuntimeError("Blocked Ctrl shortcut: Thinkorswim stole foreground")
+
     _vk_key_event(VK_CONTROL, key_up=False)
     try:
         time.sleep(hold_sec)
+        fg_mid = user32.GetForegroundWindow()
+        if fg_mid and is_tos_process_hwnd(fg_mid):
+            log_error(
+                f"Safety guard blocked keydown({ch!r}): Thinkorswim stole foreground HWND {hex(fg_mid)}"
+            )
+            raise RuntimeError("Blocked Ctrl shortcut: Thinkorswim stole foreground")
         _vk_key_event(vk, key_up=False)
         try:
             time.sleep(hold_sec)
@@ -570,6 +973,48 @@ def send_ctrl_key_reliable(key_char: str, hold_sec: float = 0.04) -> None:
         time.sleep(max(0.02, hold_sec * 0.6))
     finally:
         _vk_key_event(VK_CONTROL, key_up=True)
+
+
+def send_ctrl_insert_reliable(hold_sec: float = 0.035) -> None:
+    """
+    Sends Ctrl+Insert (extended VK_INSERT) — Java Swing JTextField's native copy binding —
+    without ever touching Ctrl+C or any letter/digit key.
+    """
+    _vk_key_event(VK_CONTROL, key_up=False)
+    try:
+        time.sleep(hold_sec)
+        _vk_key_event_ext(VK_INSERT, key_up=False)
+        try:
+            time.sleep(hold_sec)
+        finally:
+            _vk_key_event_ext(VK_INSERT, key_up=True)
+        time.sleep(0.02)
+    finally:
+        _vk_key_event(VK_CONTROL, key_up=True)
+
+
+def send_home_shift_end_reliable(hold_sec: float = 0.025) -> None:
+    """
+    Selects the full text inside a focused single-line text field via extended Home -> Shift+End
+    without ever sending Ctrl+A or any letter key.
+    """
+    _vk_key_event_ext(VK_HOME, key_up=False)
+    try:
+        time.sleep(hold_sec)
+    finally:
+        _vk_key_event_ext(VK_HOME, key_up=True)
+    time.sleep(0.02)
+    _vk_key_event(VK_SHIFT, key_up=False)
+    try:
+        time.sleep(0.02)
+        _vk_key_event_ext(VK_END, key_up=False)
+        try:
+            time.sleep(hold_sec)
+        finally:
+            _vk_key_event_ext(VK_END, key_up=True)
+        time.sleep(0.015)
+    finally:
+        _vk_key_event(VK_SHIFT, key_up=True)
 
 
 def send_enter_reliable(hold_sec: float = 0.04) -> None:
@@ -599,29 +1044,35 @@ def _is_any_alt_down() -> bool:
 
 
 def wait_for_input_settled(
-    release_alt: bool = False, max_wait_sec: float = 0.60
-) -> None:
+    release_alt: bool = False,
+    max_wait_sec: float = 0.60,
+    extra_vks: tuple[int, ...] | list[int] = (),
+) -> bool:
     """
-    Waits until physical Alt, Ctrl, Shift, D, and Left Mouse Button are released
-    BEFORE focusing target windows so neither Alt+D nor clicking the GUI button
-    interferes with Bookmap focus or Ctrl+T.
-    Only sends synthetic Alt key-up if Alt is still reported down after waiting,
-    and must NEVER be called with release_alt=True while Bookmap is focused.
+    Waits until physical Alt, Ctrl, Shift, D, `extra_vks`, and Left Mouse Button are
+    released BEFORE focusing target windows. Returns True if all settled cleanly.
+    Must NEVER be called with release_alt=True while a Swing frame (Bookmap/TOS) is focused.
     """
     t0 = time.perf_counter()
+    settled = False
     while (time.perf_counter() - t0) < max_wait_sec:
+        extra_down = any(
+            (user32.GetAsyncKeyState(vk) & 0x8000) != 0 for vk in extra_vks
+        )
         mod_down = (
             _is_any_alt_down()
             or (user32.GetAsyncKeyState(VK_D) & 0x8000) != 0
             or (user32.GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0
             or (user32.GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0
+            or extra_down
         )
         mouse_down = (user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
         if not mod_down and not mouse_down:
+            settled = True
             break
         time.sleep(0.015)
 
-    if release_alt and _is_any_alt_down():
+    if not settled and release_alt and _is_any_alt_down():
         try:
             _vk_key_event(VK_LMENU, key_up=True)
             _vk_key_event(VK_RMENU, key_up=True)
@@ -629,6 +1080,7 @@ def wait_for_input_settled(
         except Exception:
             pass
     time.sleep(0.03)
+    return settled
 
 
 # ==============================================================================
@@ -657,15 +1109,20 @@ class TickerAutomationApp:
         self._automation_lock = threading.Lock()
         self._is_running_sequence = False
 
-        # Remembered browser HWND for consistent targeting
+        # Remembered browser & Thinkorswim HWNDs for consistent targeting
         self._last_browser_hwnd: int = 0
+        self._calibrated_tos_hwnd: int = 0
+        self._last_tos_clicked_hwnd: int = 0
+        self._last_tos_click_ts: float = 0.0
 
         # Win32 Edit HWND & font handle
         self.edit_hwnd: int = 0
         self._edit_font: int = 0
 
-        # Global Hotkey Listener
+        # Global Hotkey Listeners (Alt+D via pynput, Alt+G via Win32 RegisterHotKey)
         self._hotkey_listener = None
+        self._tos_hotkey_tid: int = 0
+        self._tos_hotkey_thread: threading.Thread | None = None
         self._settings_expanded = False
 
         # Unlock Windows foreground activation lock timeout for the interactive session
@@ -700,6 +1157,13 @@ class TickerAutomationApp:
 
         # Sanitize numeric fields safely
         cfg["pinned_tab_index"] = _safe_int(cfg.get("pinned_tab_index"), 6, 1, 8)
+        cfg["tos_symbol_rel_x"] = _safe_int(cfg.get("tos_symbol_rel_x"), 0, -10000, 30000)
+        cfg["tos_symbol_rel_y"] = _safe_int(cfg.get("tos_symbol_rel_y"), 0, -10000, 30000)
+        cfg["tos_window_dpi"] = _safe_int(cfg.get("tos_window_dpi"), 0, 0, 960)
+        if not isinstance(cfg.get("tos_grab_hotkey"), str):
+            cfg["tos_grab_hotkey"] = "<alt>+g"
+        if not isinstance(cfg.get("tos_window_title"), str):
+            cfg["tos_window_title"] = ""
         cfg["ti_settle_guard_ms"] = _safe_int(cfg.get("ti_settle_guard_ms"), 400, 0, 5000)
         cfg["bookmap_focus_delay_ms"] = _safe_int(cfg.get("bookmap_focus_delay_ms"), 220, 50, 5000)
         cfg["bookmap_dialog_delay_ms"] = _safe_int(cfg.get("bookmap_dialog_delay_ms"), 280, 50, 5000)
@@ -890,12 +1354,12 @@ class TickerAutomationApp:
         )
         self.settings_btn.pack(side="right")
 
-        # ---- ROW 3: Live Status Bar (Left) + BM Only & DT Only Buttons (Right) ----
+        # ---- ROW 3: Live Status Bar (Left) + TOS / BM Only / DT Only Buttons (Right) ----
         bottom_row = tk.Frame(self.main_frame, bg=THEME["bg_main"])
         bottom_row.pack(fill="x", pady=(2, 0))
 
         self.status_var = tk.StringVar(
-            value=f"v{APP_VERSION} Ready • Click TI or type"
+            value=f"v{APP_VERSION} Ready • TI / TOS"
         )
         self.status_bar = tk.Label(
             bottom_row,
@@ -904,7 +1368,7 @@ class TickerAutomationApp:
             fg=THEME["fg_secondary"],
             bg=THEME["bg_main"],
             anchor="w",
-            width=21,
+            width=13,
         )
         self.status_bar.pack(side="left", fill="x", expand=True)
 
@@ -942,7 +1406,23 @@ class TickerAutomationApp:
                 source="BM Only", skip_browser=True
             ),
         )
-        self.bm_only_btn.pack(side="right", padx=(6, 0))
+        self.bm_only_btn.pack(side="right", padx=(4, 0))
+
+        self.tos_grab_btn = tk.Button(
+            bottom_row,
+            text="📥 TOS",
+            font=("Segoe UI", 8, "bold"),
+            bg=THEME["bg_tos_btn"],
+            fg=THEME["fg_primary"],
+            activebackground=THEME["bg_tos_btn_hover"],
+            activeforeground=THEME["fg_primary"],
+            relief="flat",
+            padx=5,
+            pady=1,
+            cursor="hand2",
+            command=lambda: self.trigger_grab_from_tos(source="TOS Button"),
+        )
+        self.tos_grab_btn.pack(side="right", padx=(4, 0))
 
         # ---- COLLAPSIBLE SETTINGS PANEL ----
         self.settings_frame = tk.Frame(
@@ -959,7 +1439,7 @@ class TickerAutomationApp:
         self.root.bind("<KeyPress>", self._on_root_keypress)
 
     def _build_settings_panel(self) -> None:
-        """Build the collapsible configuration drawer for delays & fallback coordinates."""
+        """Build the collapsible configuration drawer for delays, TOS reverse link & fallback coords."""
         self.var_always_top = tk.BooleanVar(
             value=bool(self.config.get("always_on_top", True))
         )
@@ -998,6 +1478,20 @@ class TickerAutomationApp:
         )
         self.var_browser_url_ms = tk.StringVar(
             value=str(self.config.get("browser_url_delay_ms", 100))
+        )
+
+        self.var_tos_hotkey = tk.StringVar(
+            value=str(self.config.get("tos_grab_hotkey", "<alt>+g"))
+        )
+        self.var_tos_x = tk.StringVar(
+            value=str(self.config.get("tos_symbol_rel_x", 0))
+        )
+        self.var_tos_y = tk.StringVar(
+            value=str(self.config.get("tos_symbol_rel_y", 0))
+        )
+        saved_tos_title = (self.config.get("tos_window_title") or "").strip()
+        self.var_tos_win_lbl = tk.StringVar(
+            value=(saved_tos_title[:16] if saved_tos_title else "Not picked")
         )
 
         def make_label(parent, text, row, col):
@@ -1119,8 +1613,48 @@ class TickerAutomationApp:
         )
         pick_sub_btn.grid(row=0, column=2, padx=(4, 0))
 
+        hdr3 = tk.Label(
+            self.settings_frame,
+            text="THINKORSWIM -> DEEP-DIVE (MAIN CHART FALLBACK)",
+            font=("Segoe UI", 8, "bold"),
+            fg=THEME["fg_ticker"],
+            bg=THEME["bg_card"],
+        )
+        hdr3.grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 4))
+
+        make_label(self.settings_frame, "TOS Grab Hotkey:", 7, 0)
+        make_entry(self.settings_frame, self.var_tos_hotkey, 10, 7, 1)
+        make_label(self.settings_frame, "Locked Win:", 7, 2)
+        tos_win_lbl = tk.Label(
+            self.settings_frame,
+            textvariable=self.var_tos_win_lbl,
+            font=("Consolas", 8),
+            fg=THEME["fg_primary"],
+            bg=THEME["bg_card"],
+            anchor="w",
+        )
+        tos_win_lbl.grid(row=7, column=3, sticky="w", pady=2)
+
+        make_label(self.settings_frame, "Main TOS Box (X,Y):", 8, 0)
+        tos_coord_frame = tk.Frame(self.settings_frame, bg=THEME["bg_card"])
+        tos_coord_frame.grid(row=8, column=1, columnspan=3, sticky="w")
+        make_entry(tos_coord_frame, self.var_tos_x, 5, 0, 0)
+        make_entry(tos_coord_frame, self.var_tos_y, 5, 0, 1)
+        pick_tos_btn = tk.Button(
+            tos_coord_frame,
+            text="🎯 Pick (3s)",
+            font=("Segoe UI", 8),
+            bg=THEME["bg_button"],
+            fg=THEME["fg_primary"],
+            relief="flat",
+            padx=5,
+            cursor="hand2",
+            command=self._pick_tos_symbol_coords,
+        )
+        pick_tos_btn.grid(row=0, column=2, padx=(4, 0))
+
         bot_frame = tk.Frame(self.settings_frame, bg=THEME["bg_card"])
-        bot_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        bot_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(6, 0))
 
         top_cb = tk.Checkbutton(
             bot_frame,
@@ -1173,6 +1707,14 @@ class TickerAutomationApp:
 
     def _save_settings_from_ui(self) -> None:
         try:
+            new_tos_hk = self.var_tos_hotkey.get().strip()
+            if new_tos_hk and parse_win32_hotkey(new_tos_hk) is None:
+                raise ValueError(f"bad TOS hotkey '{new_tos_hk}' (use e.g. <alt>+g)")
+
+            new_tos_x = int(self.var_tos_x.get() or 0)
+            new_tos_y = int(self.var_tos_y.get() or 0)
+            old_tos_hk = (self.config.get("tos_grab_hotkey") or "").strip()
+
             self.config["config_schema_version"] = CONFIG_SCHEMA_VERSION
             self.config["pinned_tab_index"] = max(
                 1, min(8, int(self.tab_index_var.get()))
@@ -1211,13 +1753,107 @@ class TickerAutomationApp:
                 20, int(self.var_browser_url_ms.get())
             )
 
+            self.config["tos_grab_hotkey"] = new_tos_hk
+            self.config["tos_symbol_rel_x"] = new_tos_x
+            self.config["tos_symbol_rel_y"] = new_tos_y
+            if new_tos_x <= 0 and new_tos_y <= 0:
+                self.config["tos_window_title"] = ""
+                self.config["tos_window_rect"] = None
+                self.config["tos_window_maximized"] = None
+                self.config["tos_window_dpi"] = 0
+                self._calibrated_tos_hwnd = 0
+                self.var_tos_win_lbl.set("Not picked")
+
             self.root.attributes("-topmost", self.config["always_on_top"])
             self.save_config()
+            if new_tos_hk != old_tos_hk:
+                self._restart_tos_hotkey_listener()
             self.set_status(
-                "All settings saved to config.json", THEME["fg_success"]
+                "Settings saved to config.json", THEME["fg_success"]
             )
         except ValueError as e:
-            self.set_status(f"Invalid numeric setting: {e}", THEME["fg_error"])
+            self.set_status(f"Invalid setting: {e}", THEME["fg_error"])
+
+    def _pick_tos_symbol_coords(self) -> None:
+        """
+        3-second hover countdown that locks onto the exact Thinkorswim chart window
+        under the cursor (e.g. Main@thinkorswim) and saves its symbol box offset,
+        window title, size, maximize state, and DPI.
+        """
+
+        def worker():
+            for sec in (3, 2, 1):
+                self.set_status(
+                    f"Hover Main TOS Symbol Box in {sec}s...",
+                    THEME["fg_warning"],
+                )
+                time.sleep(1.0)
+
+            with per_monitor_dpi_context():
+                pt = wintypes.POINT()
+                if not user32.GetCursorPos(ctypes.byref(pt)):
+                    self.set_status("Could not read cursor pos!", THEME["fg_error"])
+                    return
+
+                hit = user32.WindowFromPoint(pt)
+                tos_hwnd = user32.GetAncestor(hit, GA_ROOT) if hit else 0
+                if not tos_hwnd or not is_tos_frame_hwnd(tos_hwnd):
+                    self.set_status(
+                        "Cursor not over a TOS chart window!",
+                        THEME["fg_error"],
+                    )
+                    return
+
+                if self._has_tos_modal_or_popup(tos_hwnd):
+                    self.set_status(
+                        "Close TOS dialog/popup before picking!",
+                        THEME["fg_error"],
+                    )
+                    return
+
+                rect = wintypes.RECT()
+                user32.GetWindowRect(tos_hwnd, ctypes.byref(rect))
+                w = int(rect.right - rect.left)
+                h = int(rect.bottom - rect.top)
+                rel_x = int(pt.x - rect.left)
+                rel_y = int(pt.y - rect.top)
+                if rel_x <= 4 or rel_y <= 4 or rel_x >= w - 4 or rel_y >= h - 4:
+                    self.set_status(
+                        "Cursor outside TOS interior — retry!",
+                        THEME["fg_error"],
+                    )
+                    return
+
+                raw_title = get_window_text(tos_hwnd)
+                norm_title = normalize_tos_title(raw_title) or "thinkorswim"
+                zoomed = bool(user32.IsZoomed(tos_hwnd))
+                dpi = get_window_dpi(tos_hwnd)
+
+            def apply_ui():
+                self._calibrated_tos_hwnd = tos_hwnd
+                self.var_tos_x.set(str(rel_x))
+                self.var_tos_y.set(str(rel_y))
+                self.var_tos_win_lbl.set(norm_title[:16])
+                self.config["tos_symbol_rel_x"] = rel_x
+                self.config["tos_symbol_rel_y"] = rel_y
+                self.config["tos_window_title"] = norm_title
+                self.config["tos_window_rect"] = [
+                    int(rect.left),
+                    int(rect.top),
+                    w,
+                    h,
+                ]
+                self.config["tos_window_maximized"] = zoomed
+                self.config["tos_window_dpi"] = dpi
+                self.save_config()
+                self.set_status(
+                    f"TOS locked ({rel_x},{rel_y}) {norm_title[:12]}",
+                    THEME["fg_success"],
+                )
+
+            self.root.after(0, apply_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _pick_bookmap_relative_coords(
         self,
@@ -1358,14 +1994,29 @@ class TickerAutomationApp:
     def _on_root_keypress(self, event) -> None:
         """
         If the user clicks on the TI Ticker Deep-Dive window and starts typing
-        a ticker while Tkinter holds focus on self.root (instead of a Spinbox/Entry),
-        automatically route the keystroke into self.edit_hwnd!
+        a ticker (or presses Ctrl+V) while Tkinter holds focus on self.root
+        (instead of a Spinbox/Entry), route it cleanly into self.edit_hwnd!
         """
         focused_widget = self.root.focus_get()
         if isinstance(focused_widget, (tk.Entry, tk.Spinbox)):
             return
+        if (
+            (event.state & 0x0004)
+            and not (event.state & 0x20000)
+            and (event.keysym or "").lower() == "v"
+        ):
+            ok, clip_txt, _ = read_clipboard_unicode_with_owner(
+                max_bytes=256, retries=2
+            )
+            if ok and clip_txt:
+                pasted = parse_tos_ticker(clip_txt) or clean_ticker(clip_txt)
+                if pasted:
+                    self._stage_ticker_on_main_thread(
+                        pasted, f"Pasted {pasted} • Ready"
+                    )
+            return
         if event.state & 0x0004 or event.state & 0x20000:
-            # Ignore Ctrl or Alt shortcuts (e.g. Alt+D)
+            # Ignore other Ctrl or Alt shortcuts (e.g. Alt+D)
             return
 
         ch = event.char or ""
@@ -1396,8 +2047,8 @@ class TickerAutomationApp:
         """
         Detects when the user clicks inside self.edit_hwnd and ensures Tkinter's
         top-level WM_ACTIVATE handler doesn't steal keyboard focus away from it.
-        Also re-arms EM_SETSEL(0, -1) when manual editing ends so Trade-Ideas
-        External Linking always overwrites cleanly.
+        Also tracks recent clicks on Thinkorswim frames (15s TTL) so `TOS` / `Alt+G`
+        knows whether the user just clicked a thumbnail chart vs their main chart.
         """
         if not self.edit_hwnd:
             return
@@ -1422,6 +2073,13 @@ class TickerAutomationApp:
         if not user32.GetCursorPos(ctypes.byref(pt)):
             return
 
+        hit_hwnd = user32.WindowFromPoint(pt)
+        hit_root = user32.GetAncestor(hit_hwnd, GA_ROOT) if hit_hwnd else 0
+
+        if hit_root and hit_root != self._top_hwnd and is_tos_frame_hwnd(hit_root):
+            self._last_tos_clicked_hwnd = hit_root
+            self._last_tos_click_ts = time.perf_counter()
+
         edit_rect = wintypes.RECT()
         user32.GetWindowRect(self.edit_hwnd, ctypes.byref(edit_rect))
         in_edit = (
@@ -1430,8 +2088,6 @@ class TickerAutomationApp:
         )
 
         if in_edit:
-            hit_hwnd = user32.WindowFromPoint(pt)
-            hit_root = user32.GetAncestor(hit_hwnd, GA_ROOT) if hit_hwnd else 0
             if hit_root == self._top_hwnd or hit_hwnd == self.edit_hwnd:
                 was_already_editing = (
                     self._manual_edit_active
@@ -1535,6 +2191,35 @@ class TickerAutomationApp:
         else:
             self.staged_var.set("Staged: —")
 
+    def _stage_ticker_on_main_thread(
+        self, ticker: str, status_msg: str
+    ) -> None:
+        """
+        Atomically stages `ticker` on the Tkinter main thread (never racing the 25ms
+        poll and never calling lift/focus_force so Thinkorswim focus stays undisturbed).
+        """
+        if not ticker:
+            return
+        self._manual_edit_active = False
+        self._unselected_idle_prefix = ""
+        self._entry_burst_armed_for_overwrite = True
+        self.staged_ticker = ticker
+        if self.edit_hwnd:
+            set_window_text(self.edit_hwnd, ticker)
+            self._last_raw_entry_text = ticker
+            self._last_entry_change_ts = time.perf_counter()
+            user32.SendMessageW(self.edit_hwnd, EM_SETSEL, 0, -1)
+        self.staged_var.set(f"Staged: {ticker}")
+        self.set_status(status_msg, THEME["fg_success"])
+
+    def _stage_ticker_threadsafe(self, ticker: str, status_msg: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self._stage_ticker_on_main_thread(ticker, status_msg)
+        else:
+            self.root.after(
+                0, self._stage_ticker_on_main_thread, ticker, status_msg
+            )
+
     def _schedule_entry_poll(self) -> None:
         """25ms poll of the Win32 Edit HWND on the main Tkinter thread."""
         try:
@@ -1558,7 +2243,7 @@ class TickerAutomationApp:
             self.root.after(0, _apply)
 
     # --------------------------------------------------------------------------
-    # Global Hotkey Listener (Alt+D)
+    # Global Hotkey Listeners (Alt+D via pynput, Alt+G via Win32 RegisterHotKey)
     # --------------------------------------------------------------------------
     def _start_listeners(self) -> None:
         hotkey_str = self.config.get("hotkey", "<alt>+d") or "<alt>+d"
@@ -1570,6 +2255,100 @@ class TickerAutomationApp:
             self._hotkey_listener.start()
         except Exception as e:
             log_error(f"Failed to bind hotkey {hotkey_str}", e)
+
+        self._start_tos_hotkey_listener()
+
+    def _start_tos_hotkey_listener(self) -> None:
+        """
+        Registers `tos_grab_hotkey` (default Alt+G) using Win32 RegisterHotKey on a
+        dedicated daemon thread with a plain GetMessageW loop (zero Python WNDPROC
+        callbacks on Tk HWNDs). RegisterHotKey swallows the trigger key at the OS
+        level so Thinkorswim never receives the 'G' keystroke.
+        """
+        hk_raw = (self.config.get("tos_grab_hotkey") or "").strip()
+        if not hk_raw:
+            return
+        parsed = parse_win32_hotkey(hk_raw)
+        if parsed is None:
+            log_error(f"Invalid tos_grab_hotkey config: {hk_raw!r}")
+            self.set_status("Invalid TOS hotkey in config", THEME["fg_warning"])
+            return
+
+        mods, vk_code, extra_vks, disp_label = parsed
+        ready_evt = threading.Event()
+
+        def _hotkey_loop():
+            tid = int(kernel32.GetCurrentThreadId())
+            ok = bool(
+                user32.RegisterHotKey(
+                    None, HOTKEY_ID_TOS_GRAB, mods, vk_code
+                )
+            )
+            if not ok:
+                err = ctypes.get_last_error() or int(kernel32.GetLastError())
+                ready_evt.set()
+                log_error(
+                    f"RegisterHotKey failed for {disp_label} (error={err})"
+                )
+                if err == ERROR_HOTKEY_ALREADY_REGISTERED:
+                    self.set_status(
+                        f"{disp_label} busy — change in ⚙",
+                        THEME["fg_warning"],
+                    )
+                return
+
+            self._tos_hotkey_tid = tid
+            ready_evt.set()
+            try:
+                msg = wintypes.MSG()
+                while not self._closing:
+                    ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                    if ret <= 0:
+                        break
+                    if (
+                        msg.message == WM_HOTKEY
+                        and int(msg.wParam) == HOTKEY_ID_TOS_GRAB
+                    ):
+                        threading.Thread(
+                            target=self.trigger_grab_from_tos,
+                            kwargs={
+                                "source": f"Hotkey ({disp_label})",
+                                "extra_vks": tuple(extra_vks),
+                            },
+                            daemon=True,
+                        ).start()
+            except Exception as e:
+                log_error("TOS hotkey message loop error", e)
+            finally:
+                try:
+                    user32.UnregisterHotKey(None, HOTKEY_ID_TOS_GRAB)
+                except Exception:
+                    pass
+                if self._tos_hotkey_tid == tid:
+                    self._tos_hotkey_tid = 0
+
+        t = threading.Thread(target=_hotkey_loop, daemon=True)
+        self._tos_hotkey_thread = t
+        t.start()
+        ready_evt.wait(timeout=0.5)
+
+    def _stop_tos_hotkey_listener(self) -> None:
+        tid = self._tos_hotkey_tid
+        t = self._tos_hotkey_thread
+        if tid:
+            try:
+                user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+            except Exception:
+                pass
+        if t is not None and t.is_alive():
+            t.join(timeout=0.4)
+        self._tos_hotkey_tid = 0
+        self._tos_hotkey_thread = None
+
+    def _restart_tos_hotkey_listener(self) -> None:
+        self._stop_tos_hotkey_listener()
+        if not self._closing:
+            self._start_tos_hotkey_listener()
 
     def _on_hotkey_pressed(self) -> None:
         """Global hotkey (Alt+D) handler."""
@@ -1893,6 +2672,563 @@ class TickerAutomationApp:
         return "bookmap" in get_hwnd_process_name(fg).lower()
 
     # --------------------------------------------------------------------------
+    # Reverse Link: Thinkorswim -> Deep-Dive (2-Pass Live-Trading-Safe Grab)
+    # --------------------------------------------------------------------------
+    @staticmethod
+    @contextmanager
+    def _hardware_input_guard():
+        """
+        Temporarily blocks physical keyboard/mouse input (requires Administrator,
+        which run_ticker_automation.bat already uses) during the ~100-160ms TOS
+        copy burst so a simultaneous physical keypress (e.g. 'C') can NEVER combine
+        with our synthetic VK_CONTROL to trigger a TOS hotkey like Ctrl+C.
+        Synthetic input from this thread still passes through; OS auto-releases on
+        Ctrl+Alt+Del or thread exit, and `finally` guarantees immediate unblock.
+        """
+        blocked = False
+        try:
+            blocked = bool(user32.BlockInput(True))
+        except Exception:
+            blocked = False
+        try:
+            yield blocked
+        finally:
+            if blocked:
+                try:
+                    user32.BlockInput(False)
+                except Exception:
+                    pass
+
+    def _get_window_rect_or_restored(
+        self, hwnd: int
+    ) -> tuple[int, int, int, int]:
+        if user32.IsIconic(hwnd):
+            wp = WINDOWPLACEMENT()
+            wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+            if user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                rc = wp.rcNormalPosition
+                return (
+                    int(rc.left),
+                    int(rc.top),
+                    max(0, int(rc.right - rc.left)),
+                    max(0, int(rc.bottom - rc.top)),
+                )
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        return (
+            int(rect.left),
+            int(rect.top),
+            max(0, int(rect.right - rect.left)),
+            max(0, int(rect.bottom - rect.top)),
+        )
+
+    def _has_tos_modal_or_popup(self, tos_hwnd: int) -> bool:
+        """
+        Returns True if `tos_hwnd` is disabled or if the Thinkorswim process has any
+        visible modal/order-ticket/confirmation dialog (`SunAwtDialog` / popup) open.
+        """
+        if not tos_hwnd or not user32.IsWindow(tos_hwnd):
+            return True
+        if not user32.IsWindowEnabled(tos_hwnd):
+            return True
+        popup = user32.GetWindow(tos_hwnd, GW_ENABLEDPOPUP)
+        if popup and popup != tos_hwnd and user32.IsWindowVisible(popup):
+            return True
+
+        tos_pid = get_hwnd_pid(tos_hwnd)
+        found_dialog = False
+
+        def _cb(h, _):
+            nonlocal found_dialog
+            if not user32.IsWindowVisible(h):
+                return True
+            if get_hwnd_pid(h) != tos_pid:
+                return True
+            cls_low = get_window_class(h).lower()
+            if "dialog" in cls_low:
+                found_dialog = True
+                return False
+            return True
+
+        try:
+            user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        except Exception:
+            pass
+        return found_dialog
+
+    def _find_calibrated_tos_hwnd(self) -> int:
+        """
+        Finds the user's calibrated Main Thinkorswim chart window (`SunAwtFrame`),
+        strictly matching its normalized title (e.g. 'Main@thinkorswim') so an
+        8-chart detached thumbnail grid window is NEVER confused with the main chart.
+        """
+        saved_title = (self.config.get("tos_window_title") or "").strip()
+        if not saved_title:
+            return 0
+        saved_title_low = saved_title.lower()
+        saved_rect = self.config.get("tos_window_rect")
+
+        candidates: list[tuple[int, str]] = []
+        own_pid = self._own_pid
+
+        def _cb(h, _):
+            if not user32.IsWindowVisible(h):
+                return True
+            if get_hwnd_pid(h) == own_pid:
+                return True
+            if not is_tos_frame_hwnd(h):
+                return True
+            if self._get_restored_window_area(h) <= 0:
+                return True
+            t = get_window_text(h).strip()
+            if not t:
+                return True
+            candidates.append((h, t))
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        if not candidates:
+            return 0
+
+        # Priority 1: Exact session HWND if still valid and matching normalized title
+        if self._calibrated_tos_hwnd:
+            for h, t in candidates:
+                if (
+                    h == self._calibrated_tos_hwnd
+                    and normalize_tos_title(t).lower() == saved_title_low
+                ):
+                    return h
+
+        # Priority 2: Strict normalized title match (never falls back to other TOS windows)
+        matching = [
+            (h, t)
+            for (h, t) in candidates
+            if normalize_tos_title(t).lower() == saved_title_low
+        ]
+        if not matching:
+            return 0
+        if len(matching) == 1 or not (
+            isinstance(saved_rect, list) and len(saved_rect) == 4
+        ):
+            self._calibrated_tos_hwnd = matching[0][0]
+            return self._calibrated_tos_hwnd
+
+        def _geom_dist(item: tuple[int, str]) -> int:
+            lx, ty, w, h = self._get_window_rect_or_restored(item[0])
+            return (
+                abs(lx - int(saved_rect[0]))
+                + abs(ty - int(saved_rect[1]))
+                + abs(w - int(saved_rect[2]))
+                + abs(h - int(saved_rect[3]))
+            )
+
+        matching.sort(key=_geom_dist)
+        self._calibrated_tos_hwnd = matching[0][0]
+        return self._calibrated_tos_hwnd
+
+    def trigger_grab_from_tos(
+        self,
+        source: str = "TOS Button",
+        extra_vks: tuple[int, ...] = (),
+    ) -> None:
+        """
+        2-Pass Live-Trading-Safe Thinkorswim -> Deep-Dive Ticker Grab:
+          - Pass 1 (Zero-Click): If a TOS frame is focused (or was clicked within 15s,
+            such as an 8-chart thumbnail's `[TICKER]` box), sends bare `Ctrl+Insert`
+            under BlockInput. If TOS owns the new clipboard text and it's a valid
+            ticker, sends `Escape`, restores prior focus/clipboard, and stages it!
+          - Pass 2 (Calibrated Main Chart Fallback): If no symbol box was selected
+            and the user wasn't targeting an uncalibrated thumbnail window, strictly
+            verifies the calibrated Main TOS window (title, ±2px size, IsZoomed, DPI,
+            no modal/popup, unobstructed point), clicks `(rel_x, rel_y)`, restores
+            cursor, runs `Home -> Shift+End -> Ctrl+Insert -> Escape` under BlockInput,
+            restores prior focus/clipboard, and stages the ticker.
+        """
+        if threading.current_thread() is threading.main_thread():
+            threading.Thread(
+                target=self.trigger_grab_from_tos,
+                kwargs={"source": source, "extra_vks": extra_vks},
+                daemon=True,
+            ).start()
+            return
+
+        if not self._automation_lock.acquire(blocking=False):
+            return
+
+        self._is_running_sequence = True
+        saved_clip_ok = False
+        saved_clip_text: str | None = None
+        clipboard_modified = False
+
+        try:
+            # 1) Require all physical modifiers, hotkey keys, and mouse buttons to be
+            #    completely released; NEVER tap synthetic VK_MENU (Alt) — abort if held!
+            settled = wait_for_input_settled(
+                release_alt=False, max_wait_sec=0.65, extra_vks=extra_vks
+            )
+            if not settled:
+                self.set_status(
+                    "Release keys & retry TOS grab", THEME["fg_warning"]
+                )
+                return
+
+            with per_monitor_dpi_context():
+                fg_before = user32.GetForegroundWindow()
+                fg_is_tos_proc = bool(
+                    fg_before and is_tos_process_hwnd(fg_before)
+                )
+
+                # If a TOS dialog/popup (e.g. Order Confirmation) is focused, abort untouched
+                if fg_is_tos_proc and (
+                    not is_tos_frame_hwnd(fg_before)
+                    or self._has_tos_modal_or_popup(fg_before)
+                ):
+                    self.set_status(
+                        "Close TOS dialog first!", THEME["fg_error"]
+                    )
+                    return
+
+                cal_hwnd = self._find_calibrated_tos_hwnd()
+
+                # Determine which TOS window the user was just interacting with
+                recent_tos_hwnd = 0
+                if (
+                    self._last_tos_clicked_hwnd
+                    and (time.perf_counter() - self._last_tos_click_ts) <= 15.0
+                    and user32.IsWindowVisible(self._last_tos_clicked_hwnd)
+                    and is_tos_frame_hwnd(self._last_tos_clicked_hwnd)
+                ):
+                    recent_tos_hwnd = self._last_tos_clicked_hwnd
+
+                if fg_is_tos_proc:
+                    active_tos_hwnd = fg_before
+                elif recent_tos_hwnd:
+                    active_tos_hwnd = recent_tos_hwnd
+                else:
+                    active_tos_hwnd = cal_hwnd
+
+                # Save existing Unicode clipboard so we can restore it on exit
+                saved_clip_ok, saved_clip_text, _ = (
+                    read_clipboard_unicode_with_owner(max_bytes=16384)
+                )
+
+                # ==============================================================
+                # PASS 1: ZERO-CLICK COPY FROM FOCUSED TOS SYMBOL BOX
+                # (Handles all 8 thumbnail charts + main chart when symbol box clicked)
+                # ==============================================================
+                if active_tos_hwnd and (
+                    fg_is_tos_proc or active_tos_hwnd != cal_hwnd
+                ):
+                    if self._has_tos_modal_or_popup(active_tos_hwnd):
+                        self.set_status(
+                            "Close TOS dialog first!", THEME["fg_error"]
+                        )
+                        return
+
+                    focused_ok = True
+                    if not fg_is_tos_proc:
+                        focused_ok = self._focus_window(
+                            active_tos_hwnd, max_attempts=10
+                        ) and self._wait_for_stable_foreground(
+                            active_tos_hwnd, settle_ms=100, max_total_ms=500
+                        )
+
+                    if (
+                        focused_ok
+                        and user32.GetForegroundWindow() == active_tos_hwnd
+                    ):
+                        write_clipboard_unicode("")
+                        clipboard_modified = True
+                        seq0 = user32.GetClipboardSequenceNumber()
+
+                        with self._hardware_input_guard():
+                            if user32.GetForegroundWindow() == active_tos_hwnd:
+                                send_ctrl_insert_reliable(hold_sec=0.035)
+
+                        t_poll = time.perf_counter()
+                        seq_changed = False
+                        while (time.perf_counter() - t_poll) < 0.25:
+                            if user32.GetClipboardSequenceNumber() != seq0:
+                                seq_changed = True
+                                break
+                            time.sleep(0.015)
+
+                        if seq_changed:
+                            c_ok, raw_txt, owner_pid = (
+                                read_clipboard_unicode_with_owner(max_bytes=256)
+                            )
+                            owner_valid = (
+                                is_tos_pid(owner_pid)
+                                if owner_pid
+                                else is_tos_process_hwnd(
+                                    user32.GetForegroundWindow()
+                                )
+                            )
+                            ticker = (
+                                parse_tos_ticker(raw_txt or "")
+                                if (c_ok and owner_valid)
+                                else ""
+                            )
+                            if (
+                                ticker
+                                and user32.GetForegroundWindow()
+                                == active_tos_hwnd
+                            ):
+                                with self._hardware_input_guard():
+                                    if (
+                                        user32.GetForegroundWindow()
+                                        == active_tos_hwnd
+                                    ):
+                                        send_escape_reliable(hold_sec=0.03)
+
+                                if (
+                                    not fg_is_tos_proc
+                                    and fg_before
+                                    and fg_before != active_tos_hwnd
+                                    and user32.IsWindow(fg_before)
+                                ):
+                                    time.sleep(0.025)
+                                    self._focus_window(fg_before, max_attempts=6)
+
+                                self._stage_ticker_threadsafe(
+                                    ticker, f"{ticker} ← TOS ✓"
+                                )
+                                return
+
+                # ==============================================================
+                # WRONG-WINDOW GUARD BEFORE PASS 2
+                # (Never jump to Main@thinkorswim if user was on Thumbnail Grid!)
+                # ==============================================================
+                if active_tos_hwnd and active_tos_hwnd != cal_hwnd:
+                    if (
+                        not fg_is_tos_proc
+                        and fg_before
+                        and user32.IsWindow(fg_before)
+                    ):
+                        self._focus_window(fg_before, max_attempts=6)
+                    self.set_status(
+                        "Click thumbnail symbol box + Alt+G",
+                        THEME["fg_warning"],
+                    )
+                    return
+
+                # ==============================================================
+                # PASS 2: CALIBRATED MAIN SINGLE-CHART SYMBOL BOX FALLBACK
+                # ==============================================================
+                rel_x = _safe_int(self.config.get("tos_symbol_rel_x"), 0)
+                rel_y = _safe_int(self.config.get("tos_symbol_rel_y"), 0)
+                saved_title = (
+                    self.config.get("tos_window_title") or ""
+                ).strip()
+
+                if rel_x <= 0 or rel_y <= 0 or not saved_title:
+                    self.set_status(
+                        "Pick Main TOS box in ⚙ (🎯 3s)",
+                        THEME["fg_warning"],
+                    )
+                    if not self._settings_expanded:
+                        self.root.after(0, self._toggle_settings_panel)
+                    return
+
+                if not cal_hwnd:
+                    self.set_status(
+                        f"TOS '{saved_title[:12]}' not open!",
+                        THEME["fg_error"],
+                    )
+                    return
+
+                if self._has_tos_modal_or_popup(cal_hwnd):
+                    self.set_status(
+                        "Close TOS dialog first!", THEME["fg_error"]
+                    )
+                    return
+
+                # Ensure any slow clipboard activity from Pass 1 has completely settled
+                if clipboard_modified:
+                    wait_for_clipboard_quiet(quiet_ms=150, max_wait_ms=400)
+
+                was_iconic = bool(user32.IsIconic(cal_hwnd))
+                if user32.GetForegroundWindow() != cal_hwnd or was_iconic:
+                    if not self._focus_window(cal_hwnd, max_attempts=12):
+                        self.set_status(
+                            "Could not focus Main TOS!", THEME["fg_error"]
+                        )
+                        return
+                    settle_ms = 220 if was_iconic else 110
+                    self._wait_for_stable_foreground(
+                        cal_hwnd, settle_ms=settle_ms, max_total_ms=650
+                    )
+
+                if (
+                    user32.GetForegroundWindow() != cal_hwnd
+                    or user32.IsIconic(cal_hwnd)
+                    or self._has_tos_modal_or_popup(cal_hwnd)
+                ):
+                    self.set_status(
+                        "Main TOS focus/dialog blocked!", THEME["fg_error"]
+                    )
+                    return
+
+                # Strict A4 pre-click layout, maximize, DPI, and WindowFromPoint checks
+                saved_zoomed = self.config.get("tos_window_maximized")
+                cur_zoomed = bool(user32.IsZoomed(cal_hwnd))
+                if saved_zoomed is not None and cur_zoomed != bool(saved_zoomed):
+                    self.set_status(
+                        "TOS max state changed — re-pick ⚙",
+                        THEME["fg_error"],
+                    )
+                    return
+
+                saved_dpi = _safe_int(self.config.get("tos_window_dpi"), 0)
+                cur_dpi = get_window_dpi(cal_hwnd)
+                if saved_dpi > 0 and cur_dpi != saved_dpi:
+                    self.set_status(
+                        "TOS monitor DPI changed — re-pick ⚙",
+                        THEME["fg_error"],
+                    )
+                    return
+
+                rect = wintypes.RECT()
+                user32.GetWindowRect(cal_hwnd, ctypes.byref(rect))
+                cur_w = int(rect.right - rect.left)
+                cur_h = int(rect.bottom - rect.top)
+                saved_rect = self.config.get("tos_window_rect")
+                if isinstance(saved_rect, list) and len(saved_rect) == 4:
+                    if (
+                        abs(cur_w - int(saved_rect[2])) > 2
+                        or abs(cur_h - int(saved_rect[3])) > 2
+                    ):
+                        self.set_status(
+                            "Main TOS resized — re-pick in ⚙",
+                            THEME["fg_error"],
+                        )
+                        return
+
+                click_x = int(rect.left + rel_x)
+                click_y = int(rect.top + rel_y)
+                if not (
+                    rect.left + 4 <= click_x <= rect.right - 4
+                    and rect.top + 4 <= click_y <= rect.bottom - 4
+                ):
+                    self.set_status(
+                        "TOS box out of bounds — re-pick ⚙",
+                        THEME["fg_error"],
+                    )
+                    return
+
+                hit_target = user32.WindowFromPoint(
+                    wintypes.POINT(click_x, click_y)
+                )
+                hit_root = (
+                    user32.GetAncestor(hit_target, GA_ROOT)
+                    if hit_target
+                    else 0
+                )
+                if hit_root != cal_hwnd:
+                    self.set_status(
+                        "TOS symbol box covered!", THEME["fg_error"]
+                    )
+                    return
+
+                orig_pt = wintypes.POINT()
+                has_orig_pt = bool(
+                    user32.GetCursorPos(ctypes.byref(orig_pt))
+                )
+
+                write_clipboard_unicode("")
+                clipboard_modified = True
+                seq_before = user32.GetClipboardSequenceNumber()
+
+                with self._hardware_input_guard():
+                    if user32.GetForegroundWindow() != cal_hwnd:
+                        self.set_status(
+                            "TOS lost focus — aborted", THEME["fg_error"]
+                        )
+                        return
+                    pyautogui.click(click_x, click_y)
+                    time.sleep(0.045)
+                    if has_orig_pt:
+                        user32.SetCursorPos(orig_pt.x, orig_pt.y)
+                    send_home_shift_end_reliable(hold_sec=0.025)
+                    time.sleep(0.02)
+                    send_ctrl_insert_reliable(hold_sec=0.035)
+
+                t_poll2 = time.perf_counter()
+                seq2_changed = False
+                while (time.perf_counter() - t_poll2) < 0.25:
+                    if user32.GetClipboardSequenceNumber() != seq_before:
+                        seq2_changed = True
+                        break
+                    time.sleep(0.015)
+
+                raw_copied2: str | None = None
+                owner_pid2 = 0
+                c2_ok = False
+                if seq2_changed:
+                    c2_ok, raw_copied2, owner_pid2 = (
+                        read_clipboard_unicode_with_owner(max_bytes=256)
+                    )
+
+                # Close any TOS dropdown / cancel edit cleanly via Escape
+                with self._hardware_input_guard():
+                    if user32.GetForegroundWindow() == cal_hwnd:
+                        send_escape_reliable(hold_sec=0.03)
+
+                if (
+                    not fg_is_tos_proc
+                    and fg_before
+                    and fg_before != cal_hwnd
+                    and user32.IsWindow(fg_before)
+                ):
+                    time.sleep(0.03)
+                    self._focus_window(fg_before, max_attempts=6)
+
+                owner2_valid = (
+                    is_tos_pid(owner_pid2) if owner_pid2 else True
+                )
+                ticker2 = (
+                    parse_tos_ticker(raw_copied2 or "")
+                    if (seq2_changed and c2_ok and owner2_valid)
+                    else ""
+                )
+                if ticker2:
+                    self._stage_ticker_threadsafe(
+                        ticker2, f"{ticker2} ← TOS ✓"
+                    )
+                else:
+                    self.set_status(
+                        "No TOS ticker — check Pick in ⚙",
+                        THEME["fg_warning"],
+                    )
+
+        except Exception as e:
+            log_error("TOS Grab error", e)
+            self.set_status(f"TOS Grab Error: {e}", THEME["fg_error"])
+        finally:
+            if (
+                clipboard_modified
+                and saved_clip_ok
+                and saved_clip_text is not None
+            ):
+                try:
+                    write_clipboard_unicode(saved_clip_text)
+                except Exception:
+                    pass
+            # Ensure pynput's HotKey state set never retains a stale Alt modifier
+            # if physical key release overlapped BlockInput
+            try:
+                if (
+                    self._hotkey_listener is not None
+                    and not _is_any_alt_down()
+                ):
+                    for hk in getattr(self._hotkey_listener, "_hotkeys", ()):
+                        hk._state.clear()
+            except Exception:
+                pass
+            self._is_running_sequence = False
+            self._automation_lock.release()
+
+    # --------------------------------------------------------------------------
     # Deep-Dive Automation Sequence (Step 1: Bookmap -> Step 2: DilutionTracker)
     # --------------------------------------------------------------------------
     def trigger_deep_dive(
@@ -2212,6 +3548,11 @@ class TickerAutomationApp:
         try:
             if self._hotkey_listener:
                 self._hotkey_listener.stop()
+        except Exception:
+            pass
+
+        try:
+            self._stop_tos_hotkey_listener()
         except Exception:
             pass
 

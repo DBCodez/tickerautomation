@@ -2,6 +2,18 @@
     "config_schema_version": 2,
     "pinned_tab_index": 6,
     "hotkey": "<alt>+d",
+    "tos_grab_hotkey": "<alt>+g",
+    "tos_symbol_rel_x": 297,
+    "tos_symbol_rel_y": 84,
+    "tos_window_title": "Main@thinkorswim",
+    "tos_window_rect": [
+        0,
+        1080,
+        1920,
+        1032
+    ],
+    "tos_window_maximized": false,
+    "tos_window_dpi": 96,
     "ti_settle_guard_ms": 400,
     "bookmap_window_title": "Bookmap",
     "bookmap_focus_delay_ms": 220,
