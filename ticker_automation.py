@@ -1,5 +1,5 @@
 """
-Trade-Ideas <-> Thinkorswim, Bookmap & DilutionTracker Deep-Dive Utility (v2.3)
+Trade-Ideas <-> Thinkorswim, Bookmap & DilutionTracker Deep-Dive Utility (v2.4)
 ===============================================================================
 A lightweight, always-on-top dark-mode Windows background utility that:
 1. Exposes a native Win32 "Edit" control targetable by Trade-Ideas External Linking
@@ -16,16 +16,20 @@ A lightweight, always-on-top dark-mode Windows background utility that:
 4. Triggers the Deep-Dive sequence when:
    - The global hotkey (Alt+D) is pressed at any time, OR
    - The GUI buttons ("🚀 Deep-Dive (Alt+D)", "📊 BM", or "🌐 DT") are clicked.
-5. Step 1 (Bookmap) & Step 2 (DilutionTracker) with verified foreground focus and
-   universal TOS foreground protection on all Ctrl+<letter/digit> senders.
+5. Step 1 (Bookmap) & Step 2 (DilutionTracker) with verified foreground focus,
+   3-stage automatic switching to already-subscribed Bookmap tabs (skipping Ctrl+T
+   and avoiding "Already subscribed" popups), and universal TOS/HWND foreground
+   protection on all Ctrl shortcuts.
 6. Persists all settings atomically to config.json with multi-monitor bounds validation.
 """
 
 import os
 import re
 import sys
+import gzip
 import json
 import time
+import calendar
 import ctypes
 from ctypes import wintypes
 from contextlib import contextmanager
@@ -38,7 +42,7 @@ import pyperclip
 import pyautogui
 from pynput import keyboard
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 CONFIG_SCHEMA_VERSION = 2
 
 # Disable PyAutoGUI's default 100ms post-action pause so we control exact millisecond delays
@@ -98,6 +102,7 @@ DEFAULT_CONFIG = {
     "bookmap_window_title": "Bookmap",
     "bookmap_focus_delay_ms": 220,
     "bookmap_dialog_delay_ms": 280,
+    "bookmap_switch_existing_tab": True,
     "bookmap_use_symbol_click": False,
     "bookmap_symbol_rel_x": 0,
     "bookmap_symbol_rel_y": 0,
@@ -219,6 +224,7 @@ GW_ENABLEDPOPUP = 6
 MONITOR_DEFAULTTONULL = 0
 
 VK_LBUTTON = 0x01
+VK_TAB = 0x09
 VK_RETURN = 0x0D
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
@@ -241,6 +247,15 @@ SW_SHOW = 5
 GA_ROOT = 2
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+
+GENERIC_READ = 0x80000000
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+OPEN_EXISTING = 3
+FILE_ATTRIBUTE_NORMAL = 0x80
+FILE_BEGIN = 0
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 # Explicit 64-bit ctypes signatures
 user32.CreateWindowExW.restype = wintypes.HWND
@@ -432,6 +447,40 @@ kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 
+kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+kernel32.CreateFileW.restype = wintypes.HANDLE
+
+kernel32.GetFileSizeEx.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(ctypes.c_longlong),
+]
+kernel32.GetFileSizeEx.restype = wintypes.BOOL
+
+kernel32.SetFilePointerEx.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_longlong,
+    ctypes.POINTER(ctypes.c_longlong),
+    wintypes.DWORD,
+]
+kernel32.SetFilePointerEx.restype = wintypes.BOOL
+
+kernel32.ReadFile.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+kernel32.ReadFile.restype = wintypes.BOOL
+
 user32.IsWindow.argtypes = [wintypes.HWND]
 user32.IsWindow.restype = wintypes.BOOL
 
@@ -603,6 +652,113 @@ def parse_tos_ticker(raw_text: str) -> str:
         norm_sep = "." if sep == "/" else sep
         return f"{root_sym}{norm_sep}{suffix}"
     return root_sym
+
+
+_BM_COMMON_LOG_RE = re.compile(
+    r"^(log_(\d{8})_(\d{6})_(\d{3}))-common-(\d+)\.txt(\.gz)?$",
+    re.IGNORECASE,
+)
+_BM_ADD_SYM_RE = re.compile(r"Adding instrument symbol=([^,\s]+)")
+_BM_REM_TAB_RE = re.compile(r"Removing tab symbol=([^,\s]+)")
+
+
+def normalize_bookmap_symbol(raw_sym: str) -> str:
+    """
+    Normalizes a ticker or Bookmap instrument alias (e.g. 'SPRC@DXFEED' -> 'SPRC',
+    'BRK/B' or 'BRK-B' -> 'BRK.B') for reliable window-title and session-log matching.
+    Note: Bookmap's chart window title shows only the symbol (not '@<FEED>'), which is
+    unambiguous on single-feed setups such as dxFeed.
+    """
+    if not raw_sym:
+        return ""
+    s = raw_sym.strip().upper().lstrip("$")
+    if "@" in s:
+        s = s.split("@", 1)[0]
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    s = s.strip()
+    m = re.match(r"^([A-Z0-9]{1,6})[./\-]([A-Z0-9]{1,3})$", s)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    return re.sub(r"[^A-Z0-9.]", "", s)
+
+
+def read_shared_file_from_offset(
+    path: str, offset: int, max_bytes: int = 8 * 1024 * 1024
+) -> tuple[str, int]:
+    """
+    Opens `path` via Win32 CreateFileW with FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    reads complete newline-terminated bytes starting at `offset`, and closes the handle immediately
+    so Bookmap's Logback rollover/rename is never blocked.
+    Returns (decoded_complete_lines_text, new_byte_offset).
+    """
+    h_file = kernel32.CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if not h_file or h_file == INVALID_HANDLE_VALUE:
+        return "", offset
+
+    try:
+        fsize = ctypes.c_longlong(0)
+        if not kernel32.GetFileSizeEx(h_file, ctypes.byref(fsize)):
+            return "", offset
+        total_size = int(fsize.value)
+        if total_size < offset:
+            offset = 0
+        if total_size <= offset:
+            return "", offset
+
+        jumped_mid_file = False
+        to_read = total_size - offset
+        if to_read > max_bytes:
+            offset = total_size - max_bytes
+            to_read = max_bytes
+            jumped_mid_file = True
+
+        if not kernel32.SetFilePointerEx(
+            h_file, ctypes.c_longlong(offset), None, FILE_BEGIN
+        ):
+            return "", offset
+
+        chunks: list[bytes] = []
+        remaining = to_read
+        buf_size = min(65536, remaining)
+        buf = ctypes.create_string_buffer(buf_size)
+        bytes_read = wintypes.DWORD(0)
+
+        while remaining > 0:
+            ask = min(buf_size, remaining)
+            ok = kernel32.ReadFile(
+                h_file, buf, ask, ctypes.byref(bytes_read), None
+            )
+            got = int(bytes_read.value)
+            if not ok or got <= 0:
+                break
+            chunks.append(buf.raw[:got])
+            remaining -= got
+
+        if not chunks:
+            return "", offset
+        raw = b"".join(chunks)
+        last_nl = raw.rfind(b"\n")
+        if last_nl < 0:
+            return "", offset
+        new_offset = offset + last_nl + 1
+        complete = raw[: last_nl + 1]
+        if jumped_mid_file:
+            first_nl = complete.find(b"\n")
+            if first_nl < 0:
+                return "", new_offset
+            complete = complete[first_nl + 1 :]
+        return complete.decode("utf-8", errors="replace"), new_offset
+    finally:
+        kernel32.CloseHandle(h_file)
 
 
 def get_hwnd_pid(hwnd: int) -> int:
@@ -940,39 +1096,83 @@ def _vk_key_event_ext(vk: int, key_up: bool = False) -> None:
     user32.keybd_event(vk & 0xFF, scan, flags, 0)
 
 
-def send_ctrl_key_reliable(key_char: str, hold_sec: float = 0.04) -> None:
+class FocusLostError(RuntimeError):
+    """Raised when `expected_hwnd` loses foreground before or during a guarded shortcut."""
+
+
+def send_ctrl_vk_reliable(
+    vk: int,
+    *,
+    shift: bool = False,
+    hold_sec: float = 0.035,
+    expected_hwnd: int = 0,
+    label: str = "",
+) -> None:
     """
-    Sends Ctrl+<key_char> using Win32 virtual keys + hardware scan codes and explicit
-    hold durations on BOTH Ctrl and the target key.
-    LIVE-TRADING SAFETY GUARD: Refuses to fire if Thinkorswim owns the foreground window
-    (since Ctrl+<letter> combos such as Ctrl+C can be bound to live order actions in TOS).
+    Sends Ctrl+[Shift+]<vk> using Win32 virtual keys + hardware scan codes and explicit
+    hold durations.
+    LIVE-TRADING & TARGET-WINDOW SAFETY GUARD:
+    - Refuses to fire if Thinkorswim owns the foreground window (Ctrl+<letter> can trigger orders).
+    - When `expected_hwnd` is set, refuses to press `<vk>` unless `GetForegroundWindow() == expected_hwnd`
+      both BEFORE Ctrl goes down and between Ctrl/Shift-down and `<vk>`-down.
+    - Releases keys strictly in reverse order (`<vk>` up -> Shift up -> Ctrl up).
     """
-    ch = key_char.upper()
-    vk = ord(ch[0])
+    desc = label or f"VK_{vk:#04x}"
     fg_pre = user32.GetForegroundWindow()
     if fg_pre and is_tos_process_hwnd(fg_pre):
         log_error(
-            f"Safety guard blocked send_ctrl_key_reliable({ch!r}): Thinkorswim owns foreground HWND {hex(fg_pre)}"
+            f"Safety guard blocked send_ctrl_vk_reliable({desc}): Thinkorswim owns foreground HWND {hex(fg_pre)}"
         )
         raise RuntimeError("Blocked Ctrl shortcut: Thinkorswim stole foreground")
+    if expected_hwnd and fg_pre != expected_hwnd:
+        raise FocusLostError(
+            f"Target window lost foreground before {desc} (fg={hex(fg_pre or 0)}, expected={hex(expected_hwnd)})"
+        )
 
     _vk_key_event(VK_CONTROL, key_up=False)
     try:
-        time.sleep(hold_sec)
-        fg_mid = user32.GetForegroundWindow()
-        if fg_mid and is_tos_process_hwnd(fg_mid):
-            log_error(
-                f"Safety guard blocked keydown({ch!r}): Thinkorswim stole foreground HWND {hex(fg_mid)}"
-            )
-            raise RuntimeError("Blocked Ctrl shortcut: Thinkorswim stole foreground")
-        _vk_key_event(vk, key_up=False)
+        if shift:
+            _vk_key_event(VK_SHIFT, key_up=False)
         try:
             time.sleep(hold_sec)
+            fg_mid = user32.GetForegroundWindow()
+            if fg_mid and is_tos_process_hwnd(fg_mid):
+                log_error(
+                    f"Safety guard blocked keydown({desc}): Thinkorswim stole foreground HWND {hex(fg_mid)}"
+                )
+                raise RuntimeError("Blocked Ctrl shortcut: Thinkorswim stole foreground")
+            if expected_hwnd and fg_mid != expected_hwnd:
+                raise FocusLostError(
+                    f"Target window lost foreground mid-{desc} (fg={hex(fg_mid or 0)}, expected={hex(expected_hwnd)})"
+                )
+            _vk_key_event(vk, key_up=False)
+            try:
+                time.sleep(hold_sec)
+            finally:
+                _vk_key_event(vk, key_up=True)
+            time.sleep(max(0.018, hold_sec * 0.6))
         finally:
-            _vk_key_event(vk, key_up=True)
-        time.sleep(max(0.02, hold_sec * 0.6))
+            if shift:
+                _vk_key_event(VK_SHIFT, key_up=True)
     finally:
         _vk_key_event(VK_CONTROL, key_up=True)
+
+
+def send_ctrl_key_reliable(
+    key_char: str, hold_sec: float = 0.04, expected_hwnd: int = 0
+) -> None:
+    """
+    Sends Ctrl+<key_char> using Win32 virtual keys + hardware scan codes with TOS
+    and optional `expected_hwnd` foreground protection.
+    """
+    ch = key_char.upper()
+    send_ctrl_vk_reliable(
+        ord(ch[0]),
+        shift=False,
+        hold_sec=hold_sec,
+        expected_hwnd=expected_hwnd,
+        label=f"Ctrl+{ch[0]}",
+    )
 
 
 def send_ctrl_insert_reliable(hold_sec: float = 0.035) -> None:
@@ -1115,6 +1315,17 @@ class TickerAutomationApp:
         self._last_tos_clicked_hwnd: int = 0
         self._last_tos_click_ts: float = 0.0
 
+        # Bookmap active-session log tracker for instant existing-tab switching
+        self._bm_logs_dir_cache: tuple[int, str] = (0, "")
+        self._bm_log_session_key: tuple[int, str] = (0, "")
+        self._bm_log_offsets: dict[int, int] = {}
+        self._bm_log_gz_done: set[int] = set()
+        self._bm_subscribed_tabs: list[str] = []
+        self._bm_add_seq: int = 0
+        self._bm_last_added_sym: str = ""
+        self._bm_already_sub_seq: int = 0
+        self._bm_last_already_sub_sym: str = ""
+
         # Win32 Edit HWND & font handle
         self.edit_hwnd: int = 0
         self._edit_font: int = 0
@@ -1167,6 +1378,7 @@ class TickerAutomationApp:
         cfg["ti_settle_guard_ms"] = _safe_int(cfg.get("ti_settle_guard_ms"), 400, 0, 5000)
         cfg["bookmap_focus_delay_ms"] = _safe_int(cfg.get("bookmap_focus_delay_ms"), 220, 50, 5000)
         cfg["bookmap_dialog_delay_ms"] = _safe_int(cfg.get("bookmap_dialog_delay_ms"), 280, 50, 5000)
+        cfg["bookmap_switch_existing_tab"] = bool(cfg.get("bookmap_switch_existing_tab", True))
         cfg["step_transition_delay_ms"] = _safe_int(cfg.get("step_transition_delay_ms"), 250, 50, 5000)
         cfg["browser_focus_delay_ms"] = _safe_int(cfg.get("browser_focus_delay_ms"), 120, 20, 5000)
         cfg["browser_tab_delay_ms"] = _safe_int(cfg.get("browser_tab_delay_ms"), 120, 20, 5000)
@@ -2418,11 +2630,92 @@ class TickerAutomationApp:
         user32.EnumWindows(enum_proc, 0)
         return results
 
+    def _extract_bookmap_title_ticker(self, title: str) -> str:
+        """
+        Extracts the active chart symbol from a Bookmap SunAwtFrame window title.
+        Bookmap formats active chart frame titles as '<SYMBOL>        Bookmap' (8 spaces),
+        or bare 'Bookmap' when no chart is active. Requiring >=2 spaces prevents single-space
+        dialog titles (e.g. 'Restart Bookmap', 'Please update Bookmap') from matching.
+        """
+        if not title:
+            return ""
+        bm_label = (
+            self.config.get("bookmap_window_title", "Bookmap") or "Bookmap"
+        ).strip() or "Bookmap"
+        pat = r"^([^\s]+)\s{2,}" + re.escape(bm_label) + r"(?:\s|$)"
+        m = re.match(pat, title.strip(), flags=re.IGNORECASE)
+        if not m:
+            return ""
+        return normalize_bookmap_symbol(m.group(1))
+
+    def _list_bookmap_chart_frames(self) -> list[tuple[int, str, int]]:
+        """
+        Returns all visible Bookmap SunAwtFrame chart windows (main chart frame plus any
+        detached chart windows) as [(hwnd, title, area), ...] ranked by (exe_rank, -area).
+        """
+        target_title = (
+            self.config.get("bookmap_window_title", "Bookmap").strip().lower()
+        )
+        browser_exes = {
+            b.lower() for b in self.config.get("browser_executables", [])
+        }
+        frames: list[tuple[int, int, int, str]] = []
+        for (
+            hwnd,
+            title,
+            exe_name,
+            cls_name,
+            area,
+        ) in self._enum_visible_windows():
+            if exe_name in browser_exes or cls_name != "sunawtframe":
+                continue
+            t_low = title.lower()
+            is_bm_exe = "bookmap" in exe_name
+            is_bm_title = target_title in t_low
+            if not (is_bm_exe or is_bm_title):
+                continue
+            is_aux = any(
+                k in t_low
+                for k in (
+                    "control panel",
+                    "run options",
+                    "launcher",
+                    "subscribe",
+                    "plugins manager",
+                    "tutorial",
+                    "log in to your account",
+                )
+            )
+            if is_aux:
+                continue
+            exe_rank = 0 if is_bm_exe else 1
+            frames.append((exe_rank, -area, hwnd, title))
+
+        frames.sort()
+        return [(hwnd, title, -neg_area) for (_, neg_area, hwnd, title) in frames]
+
+    def _find_bookmap_chart_for_ticker(self, ticker: str) -> int:
+        """
+        If any visible Bookmap chart frame (main window or detached chart window)
+        ALREADY displays `ticker` as its active chart, returns its HWND immediately.
+        """
+        target_norm = normalize_bookmap_symbol(ticker)
+        if not target_norm:
+            return 0
+        for hwnd, title, _ in self._list_bookmap_chart_frames():
+            if self._extract_bookmap_title_ticker(title) == target_norm:
+                return hwnd
+        return 0
+
     def _find_bookmap_hwnd(self) -> int:
         """
         Finds the main Bookmap chart window. Excludes browser processes and
         deprioritizes auxiliary/launcher/dialog Bookmap windows.
         """
+        chart_frames = self._list_bookmap_chart_frames()
+        if chart_frames:
+            return chart_frames[0][0]
+
         target_title = (
             self.config.get("bookmap_window_title", "Bookmap").strip().lower()
         )
@@ -2464,6 +2757,14 @@ class TickerAutomationApp:
         candidates.sort()
         return candidates[0][3]
 
+    def _has_bookmap_modal_popup(self, bm_hwnd: int) -> bool:
+        if not bm_hwnd or not user32.IsWindow(bm_hwnd):
+            return False
+        popup_hwnd = user32.GetWindow(bm_hwnd, GW_ENABLEDPOPUP)
+        if popup_hwnd and popup_hwnd != bm_hwnd and user32.IsWindowVisible(popup_hwnd):
+            return True
+        return not bool(user32.IsWindowEnabled(bm_hwnd))
+
     def _dismiss_bookmap_modal_popup_if_any(self, bm_hwnd: int) -> None:
         """
         If Bookmap's main chart window is currently disabled by a modal dialog/popup
@@ -2480,6 +2781,346 @@ class TickerAutomationApp:
             time.sleep(0.05)
             send_escape_reliable(hold_sec=0.03)
             time.sleep(0.12)
+
+    def _locate_bookmap_logs_dir(self, bm_pid: int) -> str:
+        """
+        Resolves Bookmap's active Logs directory dynamically via process cwd
+        (e.g. 'C:\\Bookmap\\Config' -> 'C:\\Bookmap\\Logs'), with standard path fallbacks.
+        """
+        if (
+            bm_pid
+            and self._bm_logs_dir_cache[0] == bm_pid
+            and self._bm_logs_dir_cache[1]
+            and os.path.isdir(self._bm_logs_dir_cache[1])
+        ):
+            return self._bm_logs_dir_cache[1]
+
+        candidates: list[str] = []
+        if bm_pid:
+            try:
+                cwd = psutil.Process(bm_pid).cwd()
+                if cwd:
+                    parent = os.path.dirname(os.path.normpath(cwd))
+                    candidates.append(os.path.join(parent, "Logs"))
+                    candidates.append(os.path.join(cwd, "Logs"))
+            except Exception:
+                pass
+
+        candidates.append(r"C:\Bookmap\Logs")
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            candidates.append(os.path.join(local_app, "Bookmap", "Logs"))
+        candidates.append(os.path.expanduser(r"~\Bookmap\Logs"))
+
+        for cand in candidates:
+            if cand and os.path.isdir(cand):
+                if bm_pid:
+                    self._bm_logs_dir_cache = (bm_pid, cand)
+                return cand
+        return ""
+
+    def _ingest_bookmap_log_lines(self, text: str) -> None:
+        """
+        Incrementally updates subscribed tab state from Bookmap's AWT-EventQueue log lines:
+        - Adds symbol on `Adding instrument symbol=<SYM>@<FEED>`
+        - Removes symbol strictly on `Removing tab symbol=<SYM>@<FEED>, ... deleteTemporarily=false`
+        - Records duplicate rejections on `onInstrumentAlreadySubscribed <SYM> ...`
+        """
+        if not text:
+            return
+        for line in text.splitlines():
+            if "Adding instrument symbol=" in line:
+                m_add = _BM_ADD_SYM_RE.search(line)
+                if m_add:
+                    norm = normalize_bookmap_symbol(m_add.group(1))
+                    if norm:
+                        if norm not in self._bm_subscribed_tabs:
+                            self._bm_subscribed_tabs.append(norm)
+                        self._bm_add_seq += 1
+                        self._bm_last_added_sym = norm
+            elif (
+                "Removing tab symbol=" in line
+                and "deleteTemporarily=false" in line
+            ):
+                m_rem = _BM_REM_TAB_RE.search(line)
+                if m_rem:
+                    norm = normalize_bookmap_symbol(m_rem.group(1))
+                    if norm and norm in self._bm_subscribed_tabs:
+                        self._bm_subscribed_tabs.remove(norm)
+            elif "onInstrumentAlreadySubscribed " in line:
+                tail = line.split("onInstrumentAlreadySubscribed ", 1)[1].split()
+                if tail:
+                    norm = normalize_bookmap_symbol(tail[0])
+                    if norm:
+                        if norm not in self._bm_subscribed_tabs:
+                            self._bm_subscribed_tabs.append(norm)
+                        self._bm_already_sub_seq += 1
+                        self._bm_last_already_sub_sym = norm
+
+    def _sync_bookmap_log_state(self, bm_pid: int) -> tuple[list[str], bool]:
+        """
+        Incrementally reads Bookmap's active session `log_<UTC>-common-*.txt` (and any
+        rolled `.txt.gz` chunks for the same session) using FILE_SHARE_DELETE so Bookmap's
+        logger is never blocked. Returns (subscribed_tabs_copy, log_available).
+        """
+        logs_dir = self._locate_bookmap_logs_dir(bm_pid)
+        if not logs_dir:
+            return list(self._bm_subscribed_tabs), False
+
+        sessions: dict[str, dict] = {}
+        try:
+            with os.scandir(logs_dir) as it:
+                for entry in it:
+                    if not entry.is_file():
+                        continue
+                    m = _BM_COMMON_LOG_RE.match(entry.name)
+                    if not m:
+                        continue
+                    prefix = m.group(1).lower()
+                    ymd, hms, mmm = m.group(2), m.group(3), m.group(4)
+                    chunk_num = int(m.group(5))
+                    is_gz = bool(m.group(6))
+
+                    sess = sessions.get(prefix)
+                    if sess is None:
+                        try:
+                            tm = time.strptime(f"{ymd}_{hms}", "%Y%m%d_%H%M%S")
+                            epoch_utc = float(calendar.timegm(tm)) + (
+                                int(mmm) / 1000.0
+                            )
+                        except Exception:
+                            epoch_utc = 0.0
+                        sess = {
+                            "epoch": epoch_utc,
+                            "has_txt": False,
+                            "latest_mtime": 0.0,
+                            "chunks": {},
+                        }
+                        sessions[prefix] = sess
+
+                    if not is_gz:
+                        sess["has_txt"] = True
+                        try:
+                            mt = entry.stat().st_mtime
+                            if mt > sess["latest_mtime"]:
+                                sess["latest_mtime"] = mt
+                        except Exception:
+                            pass
+
+                    existing = sess["chunks"].get(chunk_num)
+                    # Prefer active uncompressed .txt if both .txt and .txt.gz transiently coexist
+                    if existing is None or (existing[1] and not is_gz):
+                        sess["chunks"][chunk_num] = (entry.path, is_gz)
+        except Exception:
+            return list(self._bm_subscribed_tabs), False
+
+        active_sessions = [
+            (pfx, info) for pfx, info in sessions.items() if info["has_txt"]
+        ]
+        if not active_sessions:
+            return list(self._bm_subscribed_tabs), False
+
+        proc_ct = 0.0
+        if bm_pid:
+            try:
+                proc_ct = float(psutil.Process(bm_pid).create_time())
+            except Exception:
+                proc_ct = 0.0
+
+        chosen_prefix = ""
+        chosen_info = None
+        if proc_ct > 0.0:
+            near = [
+                (pfx, info)
+                for pfx, info in active_sessions
+                if info["epoch"] >= (proc_ct - 15.0)
+            ]
+            if near:
+                near.sort(key=lambda kv: abs(kv[1]["epoch"] - proc_ct))
+                chosen_prefix, chosen_info = near[0]
+
+        if chosen_info is None:
+            active_sessions.sort(
+                key=lambda kv: (kv[1]["latest_mtime"], kv[1]["epoch"]),
+                reverse=True,
+            )
+            chosen_prefix, chosen_info = active_sessions[0]
+
+        session_key = (bm_pid, chosen_prefix)
+        if session_key != self._bm_log_session_key:
+            self._bm_log_session_key = session_key
+            self._bm_log_offsets.clear()
+            self._bm_log_gz_done.clear()
+            self._bm_subscribed_tabs.clear()
+
+        for chunk_num in sorted(chosen_info["chunks"].keys()):
+            c_path, is_gz = chosen_info["chunks"][chunk_num]
+            if is_gz:
+                if chunk_num in self._bm_log_gz_done:
+                    continue
+                try:
+                    with gzip.open(c_path, "rb") as gf:
+                        raw_gz = gf.read()
+                    prev_off = self._bm_log_offsets.get(chunk_num, 0)
+                    if len(raw_gz) > prev_off:
+                        tail_txt = raw_gz[prev_off:].decode(
+                            "utf-8", errors="replace"
+                        )
+                        self._ingest_bookmap_log_lines(tail_txt)
+                    self._bm_log_offsets[chunk_num] = len(raw_gz)
+                    self._bm_log_gz_done.add(chunk_num)
+                except Exception:
+                    # Leave unmarked if Bookmap is still mid-compression so next sync retries cleanly
+                    pass
+            else:
+                try:
+                    prev_off = self._bm_log_offsets.get(chunk_num, 0)
+                    new_txt, new_off = read_shared_file_from_offset(
+                        c_path, prev_off
+                    )
+                    self._bm_log_offsets[chunk_num] = new_off
+                    if new_txt:
+                        self._ingest_bookmap_log_lines(new_txt)
+                except Exception:
+                    pass
+
+        return list(self._bm_subscribed_tabs), True
+
+    def _switch_bookmap_to_tab(
+        self,
+        bm_hwnd: int,
+        bm_pid: int,
+        ticker: str,
+        approx_tabs: list[str],
+        step_label: str,
+    ) -> tuple[bool, int]:
+        """
+        Cycles Bookmap's attached instrument tabs via Ctrl+Tab / Ctrl+Shift+Tab
+        (choosing the shorter circular direction when `approx_tabs` order is known)
+        in strict lockstep with `GetWindowTextW(bm_hwnd)` and `expected_hwnd` verification.
+        Never sends Escape inside Bookmap and never fires if foreground leaves Bookmap.
+        Returns (switched_ok, active_bm_hwnd).
+        """
+        target_norm = normalize_bookmap_symbol(ticker)
+        if not bm_hwnd or not target_norm:
+            return False, bm_hwnd
+
+        cur_hwnd = bm_hwnd
+        initial_title = get_window_text(cur_hwnd)
+        cur_norm = self._extract_bookmap_title_ticker(initial_title)
+        if cur_norm == target_norm:
+            return True, cur_hwnd
+
+        reverse = False
+        if (
+            cur_norm
+            and cur_norm in approx_tabs
+            and target_norm in approx_tabs
+            and len(approx_tabs) >= 2
+        ):
+            n = len(approx_tabs)
+            ci = approx_tabs.index(cur_norm)
+            ti = approx_tabs.index(target_norm)
+            fwd = (ti - ci) % n
+            bwd = (ci - ti) % n
+            reverse = bwd < fwd
+
+        max_steps = min(24, max(6, len(approx_tabs) + 2))
+        other_frames = [
+            h for h, _, _ in self._list_bookmap_chart_frames() if h != cur_hwnd
+        ]
+        seen_titles: set[str] = {initial_title} if initial_title else set()
+        pivoted_frame = False
+        step = 0
+
+        while step < max_steps:
+            fg_now = user32.GetForegroundWindow()
+            if fg_now and is_tos_process_hwnd(fg_now):
+                raise RuntimeError(
+                    "Blocked Bookmap tab switch: Thinkorswim stole foreground"
+                )
+            if fg_now != cur_hwnd:
+                if not self._focus_window(cur_hwnd, max_attempts=6):
+                    return False, cur_hwnd
+                self._wait_for_stable_foreground(
+                    cur_hwnd, settle_ms=80, max_total_ms=300
+                )
+                # Ensure VK_TAB is cleared from Bookmap's KeymapManager.pressedKeys set
+                _vk_key_event(VK_TAB, key_up=True)
+                time.sleep(0.015)
+                if user32.GetForegroundWindow() != cur_hwnd:
+                    return False, cur_hwnd
+
+            prev_title = get_window_text(cur_hwnd)
+            shortcut_lbl = "Ctrl+Shift+Tab" if reverse else "Ctrl+Tab"
+            try:
+                send_ctrl_vk_reliable(
+                    VK_TAB,
+                    shift=reverse,
+                    hold_sec=0.025,
+                    expected_hwnd=cur_hwnd,
+                    label=shortcut_lbl,
+                )
+            except FocusLostError:
+                if not self._focus_window(cur_hwnd, max_attempts=6):
+                    return False, cur_hwnd
+                _vk_key_event(VK_TAB, key_up=True)
+                time.sleep(0.03)
+                try:
+                    send_ctrl_vk_reliable(
+                        VK_TAB,
+                        shift=reverse,
+                        hold_sec=0.025,
+                        expected_hwnd=cur_hwnd,
+                        label=shortcut_lbl,
+                    )
+                except FocusLostError:
+                    return False, cur_hwnd
+
+            t_wait = time.perf_counter()
+            new_title = prev_title
+            while (time.perf_counter() - t_wait) < 0.34:
+                time.sleep(0.015)
+                cand_title = get_window_text(cur_hwnd)
+                if cand_title and cand_title != prev_title:
+                    new_title = cand_title
+                    break
+
+            if new_title == prev_title:
+                # If cur_hwnd was a single-chart detached frame while another Bookmap frame
+                # holds the multi-tab bar, try that frame once before falling back to Stage 3.
+                if step == 0 and other_frames and not pivoted_frame:
+                    cur_hwnd = other_frames.pop(0)
+                    pivoted_frame = True
+                    self._dismiss_bookmap_modal_popup_if_any(cur_hwnd)
+                    if not self._focus_window(cur_hwnd, max_attempts=8):
+                        return False, bm_hwnd
+                    self._wait_for_stable_foreground(
+                        cur_hwnd, settle_ms=100, max_total_ms=350
+                    )
+                    piv_title = get_window_text(cur_hwnd)
+                    if self._extract_bookmap_title_ticker(piv_title) == target_norm:
+                        return True, cur_hwnd
+                    seen_titles = {piv_title} if piv_title else set()
+                    continue
+                return False, cur_hwnd
+
+            cur_norm = self._extract_bookmap_title_ticker(new_title)
+            if cur_norm == target_norm:
+                time.sleep(0.04)
+                return True, cur_hwnd
+
+            if new_title in seen_titles:
+                return False, cur_hwnd
+
+            seen_titles.add(new_title)
+            step += 1
+            self.set_status(
+                f"[{ticker}] {step_label}: Switching BM tab ({cur_norm or '...'})...",
+                THEME["fg_warning"],
+            )
+
+        return False, cur_hwnd
 
     def _find_browser_hwnd(self) -> int:
         """
@@ -3296,15 +3937,31 @@ class TickerAutomationApp:
             # ==================================================================
             if not skip_bookmap:
                 bm_step_label = "BM Only" if skip_browser else "Step 1/2"
+                switch_existing_bm = bool(
+                    self.config.get("bookmap_switch_existing_tab", True)
+                )
+                target_bm_norm = normalize_bookmap_symbol(ticker)
+                bm_done_without_dialog = False
+                post_enter_elapsed = 0.0
+
                 self.set_status(
                     f"[{ticker}] {bm_step_label}: Focusing Bookmap...",
                     THEME["fg_warning"],
                 )
-                bm_hwnd = self._find_bookmap_hwnd()
+                matched_bm_hwnd = (
+                    self._find_bookmap_chart_for_ticker(ticker)
+                    if switch_existing_bm
+                    else 0
+                )
+                bm_hwnd = matched_bm_hwnd or self._find_bookmap_hwnd()
                 bm_pid = get_hwnd_pid(bm_hwnd) if bm_hwnd else 0
                 bm_was_minimized = bool(bm_hwnd and user32.IsIconic(bm_hwnd))
 
                 if bm_hwnd:
+                    # Ensure physical Alt from Alt+D is settled before focusing a Swing frame
+                    wait_for_input_settled(
+                        release_alt=False, max_wait_sec=0.15
+                    )
                     self._dismiss_bookmap_modal_popup_if_any(bm_hwnd)
 
                 if bm_hwnd and self._focus_window(bm_hwnd, max_attempts=15):
@@ -3335,87 +3992,244 @@ class TickerAutomationApp:
                             release_alt=False, max_wait_sec=0.15
                         )
 
-                        # Copy ticker to clipboard before Ctrl+T
+                        # Always copy ticker to clipboard at start of Step 1 so BM Only preserves clipboard behavior
                         pyperclip.copy(ticker)
 
-                        # Send Ctrl+T with hardware scan codes and 40ms hold to open Subscribe dialog
-                        send_ctrl_key_reliable("t", hold_sec=0.04)
-
-                        bm_dialog_ms = _safe_int(
-                            self.config.get("bookmap_dialog_delay_ms"),
-                            280,
-                            50,
-                            5000,
-                        )
-                        time.sleep(max(100, bm_dialog_ms) / 1000.0)
-
-                        # Verify a Bookmap window (main chart or Subscribe dialog) is still foreground;
-                        # if another process stole focus during Ctrl+T, re-focus Bookmap and retry Ctrl+T!
-                        if not self._is_bookmap_foreground(bm_hwnd, bm_pid):
-                            self._focus_window(bm_hwnd, max_attempts=12)
-                            self._wait_for_stable_foreground(
-                                bm_hwnd, settle_ms=180, max_total_ms=600
+                        # ------------------------------------------------------
+                        # STAGE 1: Ticker is ALREADY the active Bookmap chart
+                        # ------------------------------------------------------
+                        if (
+                            switch_existing_bm
+                            and target_bm_norm
+                            and self._extract_bookmap_title_ticker(
+                                get_window_text(bm_hwnd)
                             )
-                            send_ctrl_key_reliable("t", hold_sec=0.04)
-                            time.sleep(max(100, bm_dialog_ms) / 1000.0)
-
-                        if self._is_bookmap_foreground(bm_hwnd, bm_pid):
-                            rect = wintypes.RECT()
-                            user32.GetWindowRect(bm_hwnd, ctypes.byref(rect))
-                            if self.config.get("bookmap_use_symbol_click", False):
-                                rel_x = _safe_int(
-                                    self.config.get("bookmap_symbol_rel_x"), 0
-                                )
-                                rel_y = _safe_int(
-                                    self.config.get("bookmap_symbol_rel_y"), 0
-                                )
-                                if rel_x != 0 or rel_y != 0:
-                                    pyautogui.click(
-                                        rect.left + rel_x, rect.top + rel_y
-                                    )
-                                    time.sleep(0.05)
-
-                            # Re-verify clipboard right before pasting so nothing overwrote it
-                            pyperclip.copy(ticker)
-                            time.sleep(0.025)
-
-                            send_ctrl_key_reliable("a", hold_sec=0.03)
-                            time.sleep(0.035)
-                            send_ctrl_key_reliable("v", hold_sec=0.035)
-                            time.sleep(0.07)
-
-                            if self.config.get(
-                                "bookmap_use_subscribe_click", False
-                            ):
-                                sub_x = _safe_int(
-                                    self.config.get("bookmap_subscribe_rel_x"),
-                                    0,
-                                )
-                                sub_y = _safe_int(
-                                    self.config.get("bookmap_subscribe_rel_y"),
-                                    0,
-                                )
-                                if sub_x != 0 or sub_y != 0:
-                                    pyautogui.click(
-                                        rect.left + sub_x, rect.top + sub_y
-                                    )
-                                    time.sleep(0.04)
-
-                            send_enter_reliable(hold_sec=0.04)
-                            time.sleep(0.10)
-
+                            == target_bm_norm
+                        ):
+                            bm_done_without_dialog = True
                             if skip_browser:
                                 self.set_status(
                                     f"BM Complete: {ticker} ({source})",
                                     THEME["fg_success"],
                                 )
                                 return
-                        elif skip_browser:
-                            self.set_status(
-                                f"[{ticker}] Bookmap focus stolen during Ctrl+T!",
-                                THEME["fg_error"],
+
+                        # ------------------------------------------------------
+                        # STAGE 2: Already subscribed in a background tab
+                        #          (Switch via Ctrl+Tab / Ctrl+Shift+Tab; skip Ctrl+T & toast!)
+                        # ------------------------------------------------------
+                        if not bm_done_without_dialog and switch_existing_bm and target_bm_norm:
+                            approx_tabs, _ = self._sync_bookmap_log_state(bm_pid)
+                            if target_bm_norm in approx_tabs:
+                                self.set_status(
+                                    f"[{ticker}] {bm_step_label}: Switching Bookmap tab...",
+                                    THEME["fg_warning"],
+                                )
+                                switched_ok, bm_hwnd = self._switch_bookmap_to_tab(
+                                    bm_hwnd,
+                                    bm_pid,
+                                    ticker,
+                                    approx_tabs,
+                                    bm_step_label,
+                                )
+                                if switched_ok:
+                                    bm_done_without_dialog = True
+                                    if skip_browser:
+                                        self.set_status(
+                                            f"BM Complete: {ticker} ({source})",
+                                            THEME["fg_success"],
+                                        )
+                                        return
+
+                        # ------------------------------------------------------
+                        # STAGE 3: Standard Ctrl+T Subscribe + Post-Enter Safety Net
+                        # ------------------------------------------------------
+                        if not bm_done_without_dialog:
+                            # Send Ctrl+T with hardware scan codes and 40ms hold to open Subscribe dialog
+                            send_ctrl_key_reliable("t", hold_sec=0.04)
+
+                            bm_dialog_ms = _safe_int(
+                                self.config.get("bookmap_dialog_delay_ms"),
+                                280,
+                                50,
+                                5000,
                             )
-                            return
+                            time.sleep(max(100, bm_dialog_ms) / 1000.0)
+
+                            # Verify a Bookmap window (main chart or Subscribe dialog) is still foreground;
+                            # if another process stole focus during Ctrl+T, re-focus Bookmap and retry Ctrl+T!
+                            if not self._is_bookmap_foreground(bm_hwnd, bm_pid):
+                                self._focus_window(bm_hwnd, max_attempts=12)
+                                self._wait_for_stable_foreground(
+                                    bm_hwnd, settle_ms=180, max_total_ms=600
+                                )
+                                send_ctrl_key_reliable("t", hold_sec=0.04)
+                                time.sleep(max(100, bm_dialog_ms) / 1000.0)
+
+                            if self._is_bookmap_foreground(bm_hwnd, bm_pid):
+                                rect = wintypes.RECT()
+                                user32.GetWindowRect(bm_hwnd, ctypes.byref(rect))
+                                if self.config.get("bookmap_use_symbol_click", False):
+                                    rel_x = _safe_int(
+                                        self.config.get("bookmap_symbol_rel_x"), 0
+                                    )
+                                    rel_y = _safe_int(
+                                        self.config.get("bookmap_symbol_rel_y"), 0
+                                    )
+                                    if rel_x != 0 or rel_y != 0:
+                                        pyautogui.click(
+                                            rect.left + rel_x, rect.top + rel_y
+                                        )
+                                        time.sleep(0.05)
+
+                                # Re-verify clipboard right before pasting so nothing overwrote it
+                                pyperclip.copy(ticker)
+                                time.sleep(0.025)
+
+                                send_ctrl_key_reliable("a", hold_sec=0.03)
+                                time.sleep(0.035)
+                                send_ctrl_key_reliable("v", hold_sec=0.035)
+                                time.sleep(0.07)
+
+                                if self.config.get(
+                                    "bookmap_use_subscribe_click", False
+                                ):
+                                    sub_x = _safe_int(
+                                        self.config.get("bookmap_subscribe_rel_x"),
+                                        0,
+                                    )
+                                    sub_y = _safe_int(
+                                        self.config.get("bookmap_subscribe_rel_y"),
+                                        0,
+                                    )
+                                    if sub_x != 0 or sub_y != 0:
+                                        pyautogui.click(
+                                            rect.left + sub_x, rect.top + sub_y
+                                        )
+                                        time.sleep(0.04)
+
+                                if switch_existing_bm:
+                                    self._sync_bookmap_log_state(bm_pid)
+                                pre_add_seq = self._bm_add_seq
+                                pre_already_seq = self._bm_already_sub_seq
+
+                                send_enter_reliable(hold_sec=0.04)
+                                t_enter = time.perf_counter()
+
+                                if switch_existing_bm and target_bm_norm:
+                                    trans_cfg_ms = _safe_int(
+                                        self.config.get("step_transition_delay_ms"),
+                                        250,
+                                        50,
+                                        5000,
+                                    )
+                                    poll_budget = (
+                                        0.65
+                                        if skip_browser
+                                        else max(
+                                            0.35,
+                                            0.10 + (max(100, trans_cfg_ms) / 1000.0),
+                                        )
+                                    )
+                                    while (time.perf_counter() - t_enter) < poll_budget:
+                                        time.sleep(0.02)
+                                        if (
+                                            self._extract_bookmap_title_ticker(
+                                                get_window_text(bm_hwnd)
+                                            )
+                                            == target_bm_norm
+                                        ):
+                                            break
+                                        approx_after, log_ok = (
+                                            self._sync_bookmap_log_state(bm_pid)
+                                        )
+                                        if (
+                                            log_ok
+                                            and self._bm_already_sub_seq
+                                            > pre_already_seq
+                                            and self._bm_last_already_sub_sym
+                                            == target_bm_norm
+                                        ):
+                                            det_h = self._find_bookmap_chart_for_ticker(
+                                                ticker
+                                            )
+                                            if det_h:
+                                                self._focus_window(
+                                                    det_h, max_attempts=8
+                                                )
+                                                bm_done_without_dialog = True
+                                                break
+
+                                            # Wait for Subscribe JDialog to finish closing so bm_hwnd itself owns foreground
+                                            t_dlg = time.perf_counter()
+                                            while (
+                                                time.perf_counter() - t_dlg
+                                            ) < 0.35:
+                                                if not self._has_bookmap_modal_popup(
+                                                    bm_hwnd
+                                                ):
+                                                    if (
+                                                        user32.GetForegroundWindow()
+                                                        != bm_hwnd
+                                                    ):
+                                                        self._focus_window(
+                                                            bm_hwnd,
+                                                            max_attempts=6,
+                                                        )
+                                                    if (
+                                                        user32.GetForegroundWindow()
+                                                        == bm_hwnd
+                                                    ):
+                                                        break
+                                                time.sleep(0.02)
+
+                                            if (
+                                                user32.GetForegroundWindow()
+                                                == bm_hwnd
+                                            ):
+                                                switched_post, bm_hwnd = (
+                                                    self._switch_bookmap_to_tab(
+                                                        bm_hwnd,
+                                                        bm_pid,
+                                                        ticker,
+                                                        approx_after,
+                                                        bm_step_label,
+                                                    )
+                                                )
+                                                if switched_post:
+                                                    bm_done_without_dialog = True
+                                            break
+                                        if (
+                                            log_ok
+                                            and self._bm_add_seq > pre_add_seq
+                                            and self._bm_last_added_sym
+                                            == target_bm_norm
+                                        ):
+                                            # Confirmed new subscription accepted; let dialog finish closing
+                                            break
+
+                                    min_post_enter = 0.10 - (
+                                        time.perf_counter() - t_enter
+                                    )
+                                    if min_post_enter > 0:
+                                        time.sleep(min_post_enter)
+                                else:
+                                    time.sleep(0.10)
+
+                                post_enter_elapsed = time.perf_counter() - t_enter
+
+                                if skip_browser:
+                                    self.set_status(
+                                        f"BM Complete: {ticker} ({source})",
+                                        THEME["fg_success"],
+                                    )
+                                    return
+                            elif skip_browser:
+                                self.set_status(
+                                    f"[{ticker}] Bookmap focus stolen during Ctrl+T!",
+                                    THEME["fg_error"],
+                                )
+                                return
                 else:
                     if skip_browser:
                         self.set_status(
@@ -3429,11 +4243,19 @@ class TickerAutomationApp:
                     )
                     time.sleep(0.10)
 
-                # Wait for Bookmap's Subscribe dialog to finish closing and releasing focus
-                trans_ms = _safe_int(
-                    self.config.get("step_transition_delay_ms"), 250, 50, 5000
-                )
-                time.sleep(max(100, trans_ms) / 1000.0)
+                if bm_done_without_dialog:
+                    time.sleep(0.08)
+                else:
+                    # Wait any remaining Subscribe-dialog teardown budget before focusing browser
+                    trans_ms = _safe_int(
+                        self.config.get("step_transition_delay_ms"), 250, 50, 5000
+                    )
+                    rem_sec = max(
+                        0.08,
+                        (0.10 + (max(100, trans_ms) / 1000.0))
+                        - post_enter_elapsed,
+                    )
+                    time.sleep(rem_sec)
 
             # ==================================================================
             # STEP 2: DILUTIONTRACKER PINNED TAB AUTOMATION

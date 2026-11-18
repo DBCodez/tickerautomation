@@ -15,7 +15,7 @@ A lightweight, always-on-top dark-mode Windows utility that links with **Trade-I
     2. **Main Chart Fallback:** Calibrate your main TOS chart's symbol box once in **`⚙ -> 🎯 Pick (3s)`** to grab its active ticker via **`Alt+G`** or **`📥 TOS`** from anywhere (even when TOS is minimized).
 - **Instant Deep-Dive Triggers (`Alt+D`, `📊 BM`, `🌐 DT`):**
   - Press **`Alt+D`** globally or click **`🚀 Deep-Dive (Alt+D)`** to run both steps (or **`📊 BM`** / **`🌐 DT`** to run either step individually):
-    1. **Step 1 — Bookmap:** Restores if minimized, focuses the main Bookmap chart window, sends `Ctrl+T` to open the Subscribe dialog, pastes the staged ticker, and presses `Enter`.
+    1. **Step 1 — Bookmap:** Restores if minimized and focuses Bookmap. If the ticker is already subscribed, automatically activates its existing Bookmap tab (skipping `Ctrl+T` and avoiding *"Already subscribed"* notifications); otherwise opens `Ctrl+T`, pastes the staged ticker, and presses `Enter`.
     2. **Step 2 — DilutionTracker:** Restores if minimized, focuses your browser window, switches to your configured pinned DilutionTracker tab (`Ctrl+1` through `Ctrl+8`, default `Ctrl+6`), focuses the address bar (`Ctrl+L`), pastes `https://dilutiontracker.com/app/search/{ticker}`, and presses `Enter`.
 - **Persistent Configuration (`config.json`):**
   - Stores your pinned tab number, window position, always-on-top preference, delays, and optional Bookmap fallback relative coordinates.
