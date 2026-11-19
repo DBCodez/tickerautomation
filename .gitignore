@@ -6,6 +6,10 @@ venv/
 env/
 error.log
 click_debug.log
+live_diagnostics.md
+live_diagnostics.md.tmp*
+automation_events.log*
+crash.log
 *.lnk
 
 # Local AI Council Instructions & State (Kept private on local machine)

@@ -498,11 +498,18 @@ if _SetProcessDpiAwarenessContext is not None:
 
 
 # ==============================================================================
-# 2. TRACE RING BUFFER, DPI AWARENESS & WINDOW GEOMETRY HELPERS
+# 2. TRACE RING BUFFER, PERSISTENT EVENT LOG, DPI AWARENESS & WINDOW GEOMETRY
 # ==============================================================================
 _TRACE_LOCK = threading.Lock()
-_TRACE_RING: deque[str] = deque(maxlen=50)
+_TRACE_RING: deque[str] = deque(maxlen=80)
 _ERROR_LOG_CALLBACK = None
+
+_EVENT_LOG_PATH: str = ""
+_EVENT_LOG_MAX_BYTES = 1_048_576
+_EVENT_LOG_HARD_CAP_BYTES = 4_194_304
+_EVENT_QUEUE: queue.SimpleQueue = queue.SimpleQueue()
+_EVENT_WRITER_LOCK = threading.Lock()
+_EVENT_WRITER_STARTED = False
 
 
 def set_error_log_callback(fn) -> None:
@@ -519,10 +526,176 @@ def _report_error(msg: str, exc: BaseException | None = None) -> None:
             pass
 
 
-def record_trace(event_msg: str) -> None:
-    ts = time.strftime("%H:%M:%S")
+def cleanup_stale_temp_files(directory: str, prefixes: tuple[str, ...]) -> None:
+    if not directory or not os.path.isdir(directory):
+        return
+    try:
+        for name in os.listdir(directory):
+            if any(name.startswith(pfx) for pfx in prefixes):
+                try:
+                    os.remove(os.path.join(directory, name))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def write_live_diagnostics_atomic(path: str, content: str) -> bool:
+    """
+    Writes `content` atomically to `path` via unique sibling temp file + retryable `os.replace`
+    so concurrent viewers/IDE reads never hit a half-written file or raise PermissionError.
+    """
+    if not path:
+        return False
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+        for delay in (0.03, 0.05, 0.08, 0.12):
+            try:
+                os.replace(tmp_path, path)
+                return True
+            except PermissionError:
+                time.sleep(delay)
+            except OSError:
+                time.sleep(delay)
+        try:
+            os.replace(tmp_path, path)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _append_event_log_batch(log_path: str, batch: list[tuple[float, str, str]]) -> None:
+    if not log_path or not batch:
+        return
+    lines_out: list[str] = []
+    for ts_epoch, level, msg in batch:
+        lt = time.localtime(ts_epoch)
+        ms = int((ts_epoch % 1.0) * 1000.0)
+        ts_str = f"{time.strftime('%Y-%m-%d %H:%M:%S', lt)}.{ms:03d}"
+        safe_msg = redact_sensitive_text(msg)
+        lines_out.append(f"{ts_str} [{level}] {safe_msg}\n")
+
+    parent = os.path.dirname(os.path.abspath(log_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    open_mode = "a"
+    try:
+        if os.path.exists(log_path):
+            sz = os.path.getsize(log_path)
+            if sz >= _EVENT_LOG_MAX_BYTES:
+                rot_path = log_path + ".1"
+                try:
+                    os.replace(log_path, rot_path)
+                except OSError:
+                    if sz >= _EVENT_LOG_HARD_CAP_BYTES:
+                        open_mode = "w"
+    except Exception:
+        pass
+
+    try:
+        with open(log_path, open_mode, encoding="utf-8") as f:
+            f.writelines(lines_out)
+            f.flush()
+    except Exception:
+        pass
+
+
+def _event_writer_loop() -> None:
+    while True:
+        try:
+            first = _EVENT_QUEUE.get(timeout=0.20)
+        except queue.Empty:
+            continue
+
+        batch: list[tuple[float, str, str]] = []
+        flush_waiters: list[threading.Event] = []
+        items = [first]
+        while len(items) < 256:
+            try:
+                items.append(_EVENT_QUEUE.get_nowait())
+            except queue.Empty:
+                break
+
+        for ts_epoch, level, payload in items:
+            if level == "__FLUSH__":
+                if isinstance(payload, threading.Event):
+                    flush_waiters.append(payload)
+            else:
+                batch.append((ts_epoch, level, str(payload)))
+
+        path = _EVENT_LOG_PATH
+        if path and batch:
+            _append_event_log_batch(path, batch)
+
+        for ev in flush_waiters:
+            try:
+                ev.set()
+            except Exception:
+                pass
+
+
+def _ensure_event_writer_started() -> None:
+    global _EVENT_WRITER_STARTED
+    if _EVENT_WRITER_STARTED:
+        return
+    with _EVENT_WRITER_LOCK:
+        if not _EVENT_WRITER_STARTED:
+            t = threading.Thread(target=_event_writer_loop, daemon=True, name="EventLogWriter")
+            t.start()
+            _EVENT_WRITER_STARTED = True
+
+
+def configure_event_log(path: str) -> None:
+    global _EVENT_LOG_PATH
+    _EVENT_LOG_PATH = str(path or "").strip()
+    if _EVENT_LOG_PATH:
+        parent = os.path.dirname(os.path.abspath(_EVENT_LOG_PATH))
+        base = os.path.basename(_EVENT_LOG_PATH)
+        diag_base = "live_diagnostics.md.tmp."
+        cleanup_stale_temp_files(parent, (base + ".tmp.", diag_base))
+        _ensure_event_writer_started()
+
+
+def flush_event_log(timeout: float = 0.5) -> bool:
+    if not _EVENT_LOG_PATH:
+        return True
+    _ensure_event_writer_started()
+    ev = threading.Event()
+    _EVENT_QUEUE.put_nowait((0.0, "__FLUSH__", ev))
+    return ev.wait(timeout=max(0.05, float(timeout)))
+
+
+def record_trace(event_msg: str, level: str = "INFO") -> None:
+    ts_epoch = time.time()
+    lt = time.localtime(ts_epoch)
+    ms = int((ts_epoch % 1.0) * 1000.0)
+    short_ts = f"{time.strftime('%H:%M:%S', lt)}.{ms:03d}"
+    lvl = str(level or "INFO").upper()
+    msg_s = str(event_msg or "")
+    line = f"[{short_ts}] [{lvl}] {msg_s}" if lvl != "INFO" else f"[{short_ts}] {msg_s}"
     with _TRACE_LOCK:
-        _TRACE_RING.append(f"[{ts}] {event_msg}")
+        _TRACE_RING.append(line)
+    if _EVENT_LOG_PATH:
+        try:
+            _ensure_event_writer_started()
+            _EVENT_QUEUE.put_nowait((ts_epoch, lvl, msg_s))
+        except Exception:
+            pass
 
 
 def get_recent_traces() -> list[str]:
@@ -1007,10 +1180,15 @@ def matches_dilution_tracker_title_ticker(title: str, ticker: str) -> bool:
 def redact_sensitive_text(text: str) -> str:
     if not text:
         return ""
-    out = re.sub(r"(?i)([A-Z]:\\Users\\)([^\\/\r\n\"]+)", r"\1<USER>", text)
+    out = re.sub(r"(?i)(\\\\\?\\)?([A-Z]:[\\/]Users[\\/])([^\\/\r\n\"]+)", r"\1\2<USER>", text)
+    out = re.sub(
+        r"(?<![A-Za-z0-9._%+-])([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?![A-Za-z0-9._%+-])",
+        "<EMAIL_REDACTED>",
+        out,
+    )
     out = re.sub(r"\b[A-Z]\d{6,10}\b", "<ACCT_REDACTED>", out)
     out = re.sub(r"\b\d{3,4}-\d{5,9}\b", "<ACCT_REDACTED>", out)
-    out = re.sub(r"\b\d{6,12}\b", "<NUM_REDACTED>", out)
+    out = re.sub(r"(?<!0x)\b\d{6,12}\b", "<NUM_REDACTED>", out)
     return out
 
 
@@ -2900,22 +3078,67 @@ def grab_ticker_from_webull_ex(
 # ==============================================================================
 # 11. ZERO-KEYSTROKE TOS THUMBNAIL GRID ENGINE + 2-PASS MAIN GRABBER
 # ==============================================================================
-def extract_tos_title_tickers(raw_title: str) -> list[str]:
+def extract_tos_raw_title_slots(raw_title: str) -> tuple[list[str], bool]:
+    """
+    Splits a Thinkorswim chart/Flexible Grid window title into positional raw slots.
+    Preserves `"0"` placeholders and non-equity instruments (`/ES`, `$SPX.X`, options).
+    Returns `(raw_slots, title_trusted)`.
+    """
     if not raw_title:
-        return []
+        return [], True
     s = re.sub(r"\s*\[build[^\]]*\]\s*$", "", raw_title.strip(), flags=re.IGNORECASE).strip()
     m = re.match(r"^(.*?)\s-\s(?=[^-]*thinkorswim)", s, flags=re.IGNORECASE)
     if not m:
-        return []
+        # e.g. workspace name contains " - " which prevents prefix split
+        if "flexible grid" in s.lower() or "," in s:
+            return [], False
+        return [], True
     prefix = m.group(1).strip()
     if not prefix:
+        return [], True
+    raw_slots = [part.strip() for part in prefix.split(",")]
+    if not raw_slots or len(raw_slots) > 16:
+        return raw_slots, False
+    if any(tok.count("(") != tok.count(")") for tok in raw_slots):
+        return raw_slots, False
+    if len(raw_slots) >= 2:
+        if not (_candidate_grid_dims(len(raw_slots), 1440, 2400) or _candidate_grid_dims(len(raw_slots), 1920, 1080)):
+            return raw_slots, False
+    return raw_slots, True
+
+
+def _parse_tos_grid_equity_slot(tok: str) -> str:
+    clean = (tok or "").strip()
+    if not clean or clean == "0":
+        return ""
+    # Futures (/ES, /NQ:XCME), indices ($SPX.X, $TICK), options (.AAPL...), expressions
+    if clean.startswith(("$", "/", ".", "(")) or ":" in clean:
+        return ""
+    return parse_strict_uppercase_ticker_token(clean)
+
+
+def extract_tos_title_slots(raw_title: str) -> list[str]:
+    """
+    Returns exact positional slots `list[str]` of length N (`"SPRC"` for valid equities,
+    `""` for empty `"0"` placeholders or non-equity instruments). Returns `[]` if untrusted
+    or if window is Main@thinkorswim without chart prefix.
+    """
+    raw_slots, trusted = extract_tos_raw_title_slots(raw_title)
+    if not raw_slots or not trusted:
         return []
-    out: list[str] = []
-    for part in prefix.split(","):
-        cand = parse_strict_uppercase_ticker_token(part.strip())
-        if cand:
-            out.append(cand)
-    return out
+    return [_parse_tos_grid_equity_slot(tok) for tok in raw_slots]
+
+
+def extract_tos_title_tickers(raw_title: str) -> list[str]:
+    """Non-empty equity tickers from a TOS window title (compatibility wrapper)."""
+    return [s for s in extract_tos_title_slots(raw_title) if s]
+
+
+def describe_empty_or_nonequity_slot(raw_slot: str) -> str:
+    clean = (raw_slot or "").strip()
+    if not clean or clean == "0":
+        return "Hovered TOS chart slot is empty ('0')"
+    return f"Hovered TOS chart is non-equity ({clean[:16]})"
 
 
 def _ocr_canon_key(sym: str) -> str:
@@ -2968,6 +3191,8 @@ class GridCellRect:
     header_y: int
     verified: bool = True
     title_idx: int = -1
+    raw_slot: str = ""
+    ocr_confirmed: bool = True
 
 
 def _sample_window_occlusion_mask(hwnd: int, rect: tuple[int, int, int, int]) -> int:
@@ -3022,18 +3247,25 @@ def _cluster_grid_ocr_candidates(raw_hits: list[tuple[int, int, str, int]]) -> l
     return clustered
 
 
-def fit_verified_grid_lattice(
+def fit_verified_grid_lattice_ex(
     win_rect: tuple[int, int, int, int],
     title_tickers: list[str],
     anchors: list[tuple[int, int, str]],
     vis_rect: tuple[int, int, int, int] | None = None,
     dpi: int = 96,
-) -> list[GridCellRect] | None:
+    raw_slots: list[str] | None = None,
+) -> tuple[list[GridCellRect] | None, bool]:
+    """
+    Fits OCR header anchors onto the full N-slot TOS Flexible Grid (preserving empty `'0'`
+    and non-equity `""` slots).
+    Returns `(cells, layout_locked)` where `layout_locked` is True ONLY when a single
+    `(rows, cols, order_mode)` survives and duplicate-symbol slots cannot mis-map `title_idx`.
+    """
     n = len(title_tickers)
-    if n < 2 or not anchors:
-        return None
-    if n > 2 and len(anchors) < 2:
-        return None
+    active_syms = [s for s in title_tickers if s]
+    n_active = len(active_syms)
+    if n < 2 or n_active == 0 or not anchors:
+        return None, False
 
     wl, wt, ww, wh = win_rect
     wr, wb = wl + ww, wt + wh
@@ -3044,20 +3276,32 @@ def fit_verified_grid_lattice(
 
     cand_dims = _candidate_grid_dims(n, v_w, int(usable_h)) or _candidate_grid_dims(n, ww, wh)
     if not cand_dims:
-        return None
+        return None, False
 
     cands: list[tuple[int, int, str]] = []
     seen_tr: set[tuple[int, int, str]] = set()
     for hx, hy, asym in sorted(anchors, key=lambda a: (a[1], a[0], a[2])):
+        if asym not in active_syms:
+            continue
         tr = (int(hx), int(hy), str(asym))
         if tr not in seen_tr:
             seen_tr.add(tr)
             cands.append(tr)
             if len(cands) >= 24:
                 break
+    if not cands:
+        return None, False
     distinct_anchor_syms = {c[2] for c in cands}
 
-    valid_layouts: list[tuple] = []
+    n_distinct_active = len(set(active_syms))
+    if n_active == 1 or n_distinct_active == 1:
+        min_req = 1
+    elif n >= 6:
+        min_req = 3 if (n_active >= 4 and len(cands) >= 3) else 2
+    else:
+        min_req = 2
+
+    valid_by_shape: dict[tuple[int, int, str], tuple] = {}
     for rows, cols, asp_pen in cand_dims:
         nom_cw = float(v_w) / cols
         nom_ch = usable_h / rows
@@ -3078,7 +3322,7 @@ def fit_verified_grid_lattice(
             for hx, hy, asym in cands:
                 slots: list[tuple[int, int, float]] = []
                 for (rr, cc), s_sym in slot_syms.items():
-                    if s_sym != asym:
+                    if not s_sym or s_sym != asym:
                         continue
                     exp_l = v_left + cc * nom_cw
                     exp_t = v_top + nom_top_pad + rr * nom_ch
@@ -3149,83 +3393,170 @@ def fit_verified_grid_lattice(
                 _dfs(pos + 1, err_acc)
 
             _dfs(0, 0.0)
-            if not best_maps or best_cnt <= 0 or (n > 2 and best_cnt < 2) or (n >= 6 and best_cnt < 3):
+            if not best_maps or best_cnt < min_req:
                 continue
 
+            best_tuple = None
             for amap in best_maps[:4]:
                 matched_syms = {slot_syms[rc] for rc in amap}
                 unm_d = len(distinct_anchor_syms - matched_syms)
-                if unm_d > 0 and (n < 6 or unm_d > 1 or len(amap) < max(5, len(distinct_anchor_syms) - 1)):
+                if unm_d > 0 and (n_active < 4 or unm_d > 1 or len(amap) < max(2, len(distinct_anchor_syms) - 1)):
                     continue
-                valid_layouts.append((rows, cols, order_mode, asp_pen, slot_syms, slot_idx, amap, best_err, len(amap), unm_d))
+                cand_entry = (rows, cols, order_mode, asp_pen, slot_syms, slot_idx, amap, best_err, len(amap), unm_d)
+                if best_tuple is None:
+                    best_tuple = cand_entry
+            if best_tuple is not None:
+                valid_by_shape[(rows, cols, order_mode)] = best_tuple
 
-    if not valid_layouts:
-        return None
-    valid_layouts.sort(
+    if not valid_by_shape:
+        return None, False
+
+    valid_layouts = sorted(
+        valid_by_shape.values(),
         key=lambda t: (t[8], -t[9], -t[3] + (0.02 if t[2] == "row_major" else 0.0), -t[7] * 1e-5),
         reverse=True,
     )
-    rows, cols, _, _, slot_syms, slot_idx, best_assigned, _, _, _ = valid_layouts[0]
+    top_cnt = valid_layouts[0][8]
+    min_unm = valid_layouts[0][9]
+    top_layouts = [t for t in valid_layouts if t[8] == top_cnt and t[9] == min_unm]
 
-    col_xs_obs: dict[int, list[int]] = {}
-    row_ys_obs: dict[int, list[int]] = {}
-    for (rr, cc), (hx, hy) in best_assigned.items():
-        col_xs_obs.setdefault(cc, []).append(hx)
-        row_ys_obs.setdefault(rr, []).append(hy)
+    # Note: for 1-row or 1-col grids, row_major and col_major produce identical slot maps -> deduplicate!
+    dedup_top: list[tuple] = []
+    seen_maps: set[tuple[tuple[int, int, str], ...]] = set()
+    for t in top_layouts:
+        sig = tuple((rc[0], rc[1], t[4][rc]) for rc in sorted(t[4].keys()))
+        if sig not in seen_maps:
+            seen_maps.add(sig)
+            dedup_top.append(t)
+    top_layouts = dedup_top
 
-    dx_hdr = max(16, min(68, int(round(sum(col_xs_obs[0]) / len(col_xs_obs[0]) - v_left)))) if 0 in col_xs_obs else int(28 * dpi_sc)
-    col_lefts: list[int] = []
-    nom_cw = float(v_w) / cols
-    for cc in range(cols):
-        if cc == 0:
-            col_lefts.append(wl)
-        elif cc in col_xs_obs:
-            avg_x = int(round(sum(col_xs_obs[cc]) / len(col_xs_obs[cc])))
-            col_lefts.append(max(wl + 40, min(wr - 40, avg_x - dx_hdr)))
-        else:
-            col_lefts.append(int(round(v_left + cc * nom_cw)))
+    def _build_cells_for_layout(entry: tuple, unique_layout: bool) -> list[GridCellRect]:
+        rows, cols, _, _, slot_syms, slot_idx, best_assigned, _, _, _ = entry
+        col_xs_obs: dict[int, list[int]] = {}
+        row_ys_obs: dict[int, list[int]] = {}
+        for (rr, cc), (hx, hy) in best_assigned.items():
+            col_xs_obs.setdefault(cc, []).append(hx)
+            row_ys_obs.setdefault(rr, []).append(hy)
 
-    dy_hdr = int(34 * dpi_sc)
-    eff_top_pad = (
-        max(0, min(int(150 * dpi_sc), int(round(sum(row_ys_obs[0]) / len(row_ys_obs[0]) - v_top - dy_hdr))))
-        if 0 in row_ys_obs
-        else nom_top_pad
-    )
-    nom_ch_eff = max(80.0, float((v_top + v_h) - (v_top + eff_top_pad))) / rows
-    row_tops: list[int] = []
-    for rr in range(rows):
-        if rr == 0:
-            row_tops.append(wt)
-        elif rr in row_ys_obs:
-            avg_y = int(round(sum(row_ys_obs[rr]) / len(row_ys_obs[rr])))
-            min_prev = (max(row_ys_obs[rr - 1]) + int(36 * dpi_sc)) if (rr - 1) in row_ys_obs else (wt + 40)
-            row_tops.append(max(min_prev, min(wb - 40, avg_y - dy_hdr)))
-        else:
-            row_tops.append(int(round(v_top + eff_top_pad + rr * nom_ch_eff)))
-
-    anchored_counts = Counter(slot_syms[rc] for rc in best_assigned)
-    leftover_unique = set((Counter(title_tickers) - anchored_counts).elements())
-    assigned_pts_set = set(best_assigned.values())
-    unused_cands = [c for c in cands if (c[0], c[1]) not in assigned_pts_set]
-
-    cells: list[GridCellRect] = []
-    for rr in range(rows):
+        dx_hdr = max(16, min(68, int(round(sum(col_xs_obs[0]) / len(col_xs_obs[0]) - v_left)))) if 0 in col_xs_obs else int(28 * dpi_sc)
+        col_lefts: list[int] = []
+        nom_cw = float(v_w) / cols
         for cc in range(cols):
-            idx = slot_idx[(rr, cc)]
-            sym = title_tickers[idx]
-            c_l = col_lefts[cc]
-            c_r = col_lefts[cc + 1] - 1 if (cc + 1) < cols else wr
-            c_t = row_tops[rr]
-            c_b = row_tops[rr + 1] - 1 if (rr + 1) < rows else wb
-            dpt = best_assigned.get((rr, cc))
-            hx, hy = dpt if dpt else (int(c_l + dx_hdr), int(c_t + dy_hdr))
-            if dpt is not None:
-                is_ver = True
+            if cc == 0:
+                col_lefts.append(wl)
+            elif cc in col_xs_obs:
+                avg_x = int(round(sum(col_xs_obs[cc]) / len(col_xs_obs[cc])))
+                col_lefts.append(max(wl + 40, min(wr - 40, avg_x - dx_hdr)))
             else:
-                edges_known = (rr in row_ys_obs or rows == 1) and (cc in col_xs_obs or cols == 1)
-                conflict = any(asym != sym and c_l <= ax <= c_r and c_t <= ay <= c_b for (ax, ay, asym) in unused_cands)
-                is_ver = bool(edges_known and (not conflict) and (len(leftover_unique) == 1 and sym in leftover_unique))
-            cells.append(GridCellRect(int(c_l), int(c_t), int(c_r), int(c_b), sym, hx, hy, bool(is_ver), idx))
+                col_lefts.append(int(round(v_left + cc * nom_cw)))
+
+        dy_hdr = int(34 * dpi_sc)
+        eff_top_pad = (
+            max(0, min(int(150 * dpi_sc), int(round(sum(row_ys_obs[0]) / len(row_ys_obs[0]) - v_top - dy_hdr))))
+            if 0 in row_ys_obs
+            else nom_top_pad
+        )
+        nom_ch_eff = max(80.0, float((v_top + v_h) - (v_top + eff_top_pad))) / rows
+        row_tops: list[int] = []
+        for rr in range(rows):
+            if rr == 0:
+                row_tops.append(wt)
+            elif rr in row_ys_obs:
+                avg_y = int(round(sum(row_ys_obs[rr]) / len(row_ys_obs[rr])))
+                min_prev = (max(row_ys_obs[rr - 1]) + int(36 * dpi_sc)) if (rr - 1) in row_ys_obs else (wt + 40)
+                row_tops.append(max(min_prev, min(wb - 40, avg_y - dy_hdr)))
+            else:
+                row_tops.append(int(round(v_top + eff_top_pad + rr * nom_ch_eff)))
+
+        anchored_counts = Counter(slot_syms[rc] for rc in best_assigned if slot_syms[rc])
+        leftover_unique = set((Counter(active_syms) - anchored_counts).elements())
+        assigned_pts_set = set(best_assigned.values())
+        unused_cands = [c for c in cands if (c[0], c[1]) not in assigned_pts_set]
+
+        out_cells: list[GridCellRect] = []
+        for rr in range(rows):
+            for cc in range(cols):
+                idx = slot_idx[(rr, cc)]
+                sym = title_tickers[idx]
+                raw_s = raw_slots[idx] if (raw_slots is not None and idx < len(raw_slots)) else sym
+                c_l = col_lefts[cc]
+                c_r = col_lefts[cc + 1] - 1 if (cc + 1) < cols else wr
+                c_t = row_tops[rr]
+                c_b = row_tops[rr + 1] - 1 if (rr + 1) < rows else wb
+                dpt = best_assigned.get((rr, cc))
+                hx, hy = dpt if dpt else (int(c_l + dx_hdr), int(c_t + dy_hdr))
+                if not sym:
+                    # Empty / non-equity slot: verified when layout is uniquely established & no stray ticker OCR hit inside box
+                    conflict = any(c_l <= ax <= c_r and c_t <= ay <= c_b for (ax, ay, _asym) in unused_cands)
+                    is_ver = bool(unique_layout and not conflict)
+                    is_conf = is_ver
+                elif dpt is not None:
+                    is_ver = True
+                    is_conf = True
+                else:
+                    edges_known = (rr in row_ys_obs or rows == 1) and (cc in col_xs_obs or cols == 1)
+                    conflict = any(asym != sym and c_l <= ax <= c_r and c_t <= ay <= c_b for (ax, ay, asym) in unused_cands)
+                    is_ver = bool(unique_layout and edges_known and (not conflict) and (len(leftover_unique) == 1 and sym in leftover_unique))
+                    is_conf = False
+                out_cells.append(
+                    GridCellRect(
+                        int(c_l), int(c_t), int(c_r), int(c_b),
+                        sym, hx, hy, bool(is_ver), idx, raw_s, bool(is_conf),
+                    )
+                )
+        return out_cells
+
+    if len(top_layouts) == 1:
+        entry = top_layouts[0]
+        cells = _build_cells_for_layout(entry, unique_layout=True)
+        # Check duplicate tickers: only lock persistent title_idx skeleton if no unanchored duplicates remain
+        sym_counts = Counter(active_syms)
+        best_assigned = entry[6]
+        slot_syms = entry[4]
+        anchored_counts = Counter(slot_syms[rc] for rc in best_assigned if slot_syms[rc])
+        dup_locked = all(
+            anchored_counts.get(s, 0) >= cnt
+            for s, cnt in sym_counts.items()
+            if cnt > 1
+        )
+        return cells, bool(dup_locked)
+
+    # Multiple surviving shapes/orderings (e.g. cold start with only slot 0 filled):
+    # NEVER lock skeleton yet, and ONLY keep cells verified where all surviving layouts agree!
+    cand_lists = [_build_cells_for_layout(e, unique_layout=True) for e in top_layouts[:6]]
+    primary = cand_lists[0]
+    for ci, pc in enumerate(primary):
+        if not pc.verified:
+            continue
+        agreed_all = True
+        for olist in cand_lists[1:]:
+            if not any(
+                oc.verified
+                and oc.ticker == pc.ticker
+                and abs(oc.left - pc.left) <= 45
+                and abs(oc.top - pc.top) <= 45
+                and abs(oc.right - pc.right) <= 45
+                and abs(oc.bottom - pc.bottom) <= 45
+                for oc in olist
+            ):
+                agreed_all = False
+                break
+        if not agreed_all:
+            primary[ci] = GridCellRect(
+                pc.left, pc.top, pc.right, pc.bottom,
+                pc.ticker, pc.header_x, pc.header_y, False, pc.title_idx, pc.raw_slot, False,
+            )
+    return primary, False
+
+
+def fit_verified_grid_lattice(
+    win_rect: tuple[int, int, int, int],
+    title_tickers: list[str],
+    anchors: list[tuple[int, int, str]],
+    vis_rect: tuple[int, int, int, int] | None = None,
+    dpi: int = 96,
+) -> list[GridCellRect] | None:
+    cells, _ = fit_verified_grid_lattice_ex(win_rect, title_tickers, anchors, vis_rect=vis_rect, dpi=dpi)
     return cells
 
 
@@ -3234,7 +3565,7 @@ def _deduplicate_grid_hits_by_multiplicity(
 ) -> list[tuple[int, int, str]]:
     if not raw_hits:
         return []
-    allowed = Counter(title_tickers)
+    allowed = Counter(s for s in title_tickers if s)
     clustered: list[tuple[int, int, str, int]] = []
     for wx, wy, sym, widx in sorted(raw_hits, key=lambda h: (0 if h[3] == 0 else 1, h[1], h[0])):
         if any(es == sym and abs(wx - ex) <= 210 and abs(wy - ey) <= 115 for (ex, ey, es, _) in clustered):
@@ -3255,21 +3586,35 @@ def _deduplicate_grid_hits_by_multiplicity(
 class TosGridCacheAndTracker:
     """
     Zero-keystroke TOS Flexible Grid & Detached Chart tracker:
-      - In-place `title_idx` remapping when window title tickers update.
+      - Preserves empty `'0'` and non-equity slots across the full N-slot layout.
+      - Projects slot changes in 0.05ms once layout_locked without re-scanning OCR.
+      - Optional single-cell OCR confirmation (`promote_tos`) on newly projected slots.
       - Own-push echo suppression across linked TOS charts (`record_own_push`).
-      - Fast 0.05ms non-blocking lookup safe to invoke directly on WM_HOTKEY press.
-      - Synchronous OCR fallback when a grid window has never been warmed yet.
+      - Fast 3-state lookup (`"hit"` / `"empty"` / `"miss"`) + targeted cursor-tile OCR fallback.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._title_hist: dict[int, tuple[tuple[str, ...], str, float]] = {}
-        self._grid_cache: dict[int, tuple[tuple[int, int, int, int], int, tuple[str, ...], list[GridCellRect], int, float]] = {}
+        # Cache tuple: (win_rect, win_dpi, slots_tup, raw_slots_tup, cells, occ_mask, scan_ts, layout_locked)
+        self._grid_cache: dict[
+            int,
+            tuple[
+                tuple[int, int, int, int],
+                int,
+                tuple[str, ...],
+                tuple[str, ...],
+                list[GridCellRect],
+                int,
+                float,
+                bool,
+            ],
+        ] = {}
         self._scanning_hwnds: set[int] = set()
         self._scan_locks: dict[int, threading.Lock] = {}
         self._fail_backoff: dict[int, tuple[tuple[int, int, int, int], tuple[str, ...], float, float]] = {}
-        self._cell_probe_ts: dict[int, float] = {}
         self._last_own_push: tuple[str, float] = ("", 0.0)
+        self._untrusted_logged: set[tuple[int, str]] = set()
 
     def record_own_push(self, ticker: str) -> None:
         clean = str(ticker or "").strip().upper()
@@ -3293,13 +3638,71 @@ class TosGridCacheAndTracker:
                 self._scan_locks[hwnd] = lk
             return lk
 
+    @staticmethod
+    def _project_cells_in_place(
+        cells: list[GridCellRect], slots_tup: tuple[str, ...], raw_tup: tuple[str, ...]
+    ) -> list[GridCellRect] | None:
+        if len(cells) != len(slots_tup) or not all(0 <= c.title_idx < len(slots_tup) for c in cells):
+            return None
+        out: list[GridCellRect] = []
+        for c in cells:
+            idx = c.title_idx
+            new_s = slots_tup[idx]
+            new_r = raw_tup[idx] if idx < len(raw_tup) else new_s
+            if c.ticker == new_s and c.raw_slot == new_r:
+                out.append(c)
+            else:
+                out.append(
+                    GridCellRect(
+                        c.left, c.top, c.right, c.bottom,
+                        new_s, c.header_x, c.header_y, True, idx, new_r,
+                        ocr_confirmed=(not new_s),
+                    )
+                )
+        return out
+
+    @staticmethod
+    def _check_single_chart_shortcut(
+        slots: list[str], raw_slots: list[str], trusted: bool
+    ) -> tuple[str, str, str]:
+        if not trusted or not slots:
+            return "grid", "", ""
+        if len(slots) == 1:
+            if slots[0]:
+                return "hit", slots[0], f"{slots[0]} ← TOS Chart ✓"
+            return "empty", "", describe_empty_or_nonequity_slot(raw_slots[0] if raw_slots else "")
+        first = slots[0]
+        if first and all(s == first for s in slots):
+            return "hit", first, f"{first} ← TOS Chart ✓"
+        if all(not s for s in slots):
+            if raw_slots and all(r in ("", "0") for r in raw_slots):
+                return "empty", "", "All TOS grid slots are empty ('0')"
+        return "grid", "", ""
+
+    def _parse_window_slots(self, hwnd: int, raw_title: str) -> tuple[list[str], list[str], bool]:
+        raw_slots, trusted = extract_tos_raw_title_slots(raw_title)
+        if not trusted:
+            slots = []
+            tk_key = (int(hwnd), raw_title[:80])
+            if tk_key not in self._untrusted_logged and raw_title:
+                self._untrusted_logged.add(tk_key)
+                if len(self._untrusted_logged) > 64:
+                    self._untrusted_logged.clear()
+                record_trace(f"TOS_TITLE_UNTRUSTED hwnd=0x{hwnd:X} title={raw_title!r}", level="WARN")
+        else:
+            slots = [_parse_tos_grid_equity_slot(tok) for tok in raw_slots] if raw_slots else []
+        return slots, raw_slots, trusted
+
     def observe_tos_window(self, win: WindowInfo) -> tuple[list[str], str, float]:
         if win.is_iconic:
             return [], "", 9999.0
-        t_list = extract_tos_title_tickers(win.title)
+        t_list, raw_slots, trusted = self._parse_window_slots(win.hwnd, win.title)
         t_tup = tuple(t_list)
+        raw_tup = tuple(raw_slots)
         now = time.monotonic()
         with self._lock:
+            if not trusted:
+                self._grid_cache.pop(win.hwnd, None)
             own_sym, own_ts = self._last_own_push
             own_recent = own_ts > 0.0 and (now - own_ts) <= 10.0
             prev = self._title_hist.get(win.hwnd)
@@ -3312,27 +3715,26 @@ class TosGridCacheAndTracker:
                 diff_sym = ""
                 if len(t_tup) == len(old_tup) and t_tup:
                     diffs = [(i, o, n) for i, (o, n) in enumerate(zip(old_tup, t_tup)) if o != n]
-                    if len(diffs) == 1:
-                        diff_sym = diffs[0][2]
+                    non_empty_diffs = [(i, o, n) for (i, o, n) in diffs if n]
+                    if len(non_empty_diffs) == 1:
+                        diff_sym = non_empty_diffs[0][2]
                     cached = self._grid_cache.get(win.hwnd)
-                    if diffs and cached is not None and cached[0] == win.rect and cached[1] == win.dpi and len(cached[3]) == len(t_tup):
-                        new_cells = list(cached[3])
-                        if all(0 <= c.title_idx < len(t_tup) for c in new_cells):
-                            by_tidx = {c.title_idx: ci for ci, c in enumerate(new_cells)}
-                            remapped = 0
-                            for chg_idx, _o, new_s in diffs:
-                                ci = by_tidx.get(chg_idx)
-                                if ci is not None:
-                                    c0 = new_cells[ci]
-                                    new_cells[ci] = GridCellRect(
-                                        c0.left, c0.top, c0.right, c0.bottom,
-                                        new_s, c0.header_x, c0.header_y, c0.verified, c0.title_idx,
-                                    )
-                                    remapped += 1
-                            if remapped == len(diffs):
-                                self._grid_cache[win.hwnd] = (win.rect, win.dpi, t_tup, new_cells, cached[4], cached[5])
+                    if (
+                        trusted
+                        and diffs
+                        and cached is not None
+                        and cached[0] == win.rect
+                        and cached[1] == win.dpi
+                        and cached[7]
+                        and len(cached[4]) == len(t_tup)
+                    ):
+                        projected = self._project_cells_in_place(cached[4], t_tup, raw_tup)
+                        if projected is not None:
+                            self._grid_cache[win.hwnd] = (
+                                win.rect, win.dpi, t_tup, raw_tup, projected, cached[5], cached[6], True,
+                            )
                 if not diff_sym:
-                    added = [s for s in t_tup if s not in set(old_tup)]
+                    added = [s for s in t_tup if s and s not in set(old_tup)]
                     if len(added) == 1:
                         diff_sym = added[0]
                 if diff_sym:
@@ -3348,24 +3750,49 @@ class TosGridCacheAndTracker:
             age = (now - last_ts) if (last_sym and last_ts > 0.0) else 9999.0
             return t_list, last_sym, age
 
-    def fast_lookup_at_press(self, root_hwnd: int, raw_title: str, cx: int, cy: int) -> str:
-        """Non-blocking <0.1ms lookup safe to call synchronously on WM_HOTKEY."""
+    def fast_lookup_at_press_ex(self, root_hwnd: int, raw_title: str, cx: int, cy: int) -> tuple[str, str, str, bool]:
+        """
+        Non-blocking <0.1ms 3-state lookup safe to invoke synchronously on WM_HOTKEY.
+        Returns `(state, ticker, detail, ocr_confirmed)` where `state` in `("hit", "empty", "miss")`.
+        """
         if not root_hwnd or not raw_title or user32.IsIconic(root_hwnd):
-            return ""
-        t_list = extract_tos_title_tickers(raw_title)
-        if not t_list:
-            return ""
-        if len(set(t_list)) == 1:
-            return t_list[0]
+            return "miss", "", "", False
+        t_list, raw_slots, trusted = self._parse_window_slots(root_hwnd, raw_title)
+        if not trusted or not t_list:
+            return "miss", "", "", False
+        sc_state, sc_sym, sc_msg = self._check_single_chart_shortcut(t_list, raw_slots, trusted)
+        if sc_state in ("hit", "empty"):
+            return sc_state, sc_sym, sc_msg, True
+
         rect_now = get_window_rect_or_restored(root_hwnd)
         t_tup = tuple(t_list)
+        raw_tup = tuple(raw_slots)
         with self._lock:
             cached = self._grid_cache.get(root_hwnd)
-            if cached is not None and cached[0] == rect_now and cached[2] == t_tup:
-                for c in cached[3]:
+            if cached is not None and cached[0] == rect_now and len(cached[2]) == len(t_tup):
+                cells = cached[4]
+                if cached[2] != t_tup or cached[3] != raw_tup:
+                    if cached[7]:
+                        proj = self._project_cells_in_place(cells, t_tup, raw_tup)
+                        if proj is not None:
+                            cells = proj
+                            self._grid_cache[root_hwnd] = (
+                                cached[0], cached[1], t_tup, raw_tup, cells, cached[5], cached[6], True,
+                            )
+                        else:
+                            cells = []
+                    else:
+                        cells = []
+                for c in cells:
                     if c.verified and c.left <= cx <= c.right and c.top <= cy <= c.bottom:
-                        return c.ticker
-        return ""
+                        if c.ticker:
+                            return "hit", c.ticker, f"{c.ticker} ← TOS Grid ✓", bool(c.ocr_confirmed)
+                        return "empty", "", describe_empty_or_nonequity_slot(c.raw_slot), True
+        return "miss", "", "", False
+
+    def fast_lookup_at_press(self, root_hwnd: int, raw_title: str, cx: int, cy: int) -> str:
+        state, sym, _, _ = self.fast_lookup_at_press_ex(root_hwnd, raw_title, cx, cy)
+        return sym if state == "hit" else ""
 
     def schedule_warmup_scan(
         self, win: WindowInfo, sidecar: UiaOcrSidecar, hud_exclude_rect: tuple[int, int, int, int] | None = None
@@ -3373,9 +3800,14 @@ class TosGridCacheAndTracker:
         if win.is_iconic:
             return
         t_list, _, _ = self.observe_tos_window(win)
-        if len(set(t_list)) <= 1:
+        raw_slots, trusted = extract_tos_raw_title_slots(win.title)
+        if not trusted or len(t_list) <= 1 or not any(t_list):
+            return
+        sc_state, _, _ = self._check_single_chart_shortcut(t_list, raw_slots, trusted)
+        if sc_state != "grid":
             return
         t_tup = tuple(t_list)
+        raw_tup = tuple(raw_slots)
         now = time.monotonic()
         with self._lock:
             if win.hwnd in self._scanning_hwnds:
@@ -3384,14 +3816,25 @@ class TosGridCacheAndTracker:
             if bf and bf[0] == win.rect and bf[1] == t_tup and now < bf[2]:
                 return
             cached = self._grid_cache.get(win.hwnd)
-            if cached is not None and cached[0] == win.rect and cached[1] == win.dpi and cached[2] == t_tup:
-                if all(c.verified for c in cached[3]):
+            if cached is not None and cached[0] == win.rect and cached[1] == win.dpi and len(cached[2]) == len(t_tup):
+                if cached[7]:
+                    if cached[2] != t_tup or cached[3] != raw_tup:
+                        proj = self._project_cells_in_place(cached[4], t_tup, raw_tup)
+                        if proj is not None:
+                            self._grid_cache[win.hwnd] = (
+                                cached[0], cached[1], t_tup, raw_tup, proj, cached[5], cached[6], True,
+                            )
+                    if all(c.verified for c in self._grid_cache[win.hwnd][4]):
+                        return
+                elif cached[2] == t_tup and all(c.verified for c in cached[4]):
                     return
             self._scanning_hwnds.add(win.hwnd)
 
         def _bg():
             try:
-                self._scan_grid_synchronously(win, t_list, sidecar, hud_exclude_rect, abort_on_fg=True)
+                self._scan_grid_synchronously(
+                    win, t_list, sidecar, hud_exclude_rect, abort_on_fg=True, allow_full_sweep=True, raw_slots=raw_slots
+                )
             finally:
                 with self._lock:
                     self._scanning_hwnds.discard(win.hwnd)
@@ -3404,7 +3847,7 @@ class TosGridCacheAndTracker:
         min_y_scr: int = -999999, prefer_inverted: bool = True,
     ) -> list[tuple[int, int, str, int]]:
         hits: list[tuple[int, int, str, int]] = []
-        if bw < 60 or bh < 24:
+        if bw < 60 or bh < 24 or not whitelist:
             return hits
         own_pid = get_own_pid()
         reject_commas = len(whitelist) > 1
@@ -3461,6 +3904,9 @@ class TosGridCacheAndTracker:
     ) -> str:
         if win.is_iconic or user32.IsIconic(win.hwnd):
             return ""
+        whitelist = {s for s in title_tickers if s}
+        if not whitelist or not cell.ticker:
+            return ""
         vis_rect = get_visible_frame_rect(win.hwnd, win.rect, win.is_zoomed)
         dpi_sc = max(1.0, float(win.dpi or 96) / 96.0)
         min_grid_y = vis_rect[1] + int(40 * dpi_sc)
@@ -3471,7 +3917,7 @@ class TosGridCacheAndTracker:
         if bw < 60 or bh < 24:
             return ""
         hits = self._ocr_band_for_window(
-            win, bx, by, bw, bh, 3, set(title_tickers), sidecar, hud_exclude_rect, min_y_scr=min_grid_y, prefer_inverted=False
+            win, bx, by, bw, bh, 3, whitelist, sidecar, hud_exclude_rect, min_y_scr=min_grid_y, prefer_inverted=False
         )
         if not hits:
             return ""
@@ -3484,36 +3930,60 @@ class TosGridCacheAndTracker:
                 cached = self._grid_cache.get(win.hwnd)
                 if cached is not None and cached[0] == win.rect and cached[2] == tuple(title_tickers):
                     upd = [
-                        GridCellRect(c0.left, c0.top, c0.right, c0.bottom, c0.ticker, hx, hy, True, c0.title_idx)
+                        GridCellRect(
+                            c0.left, c0.top, c0.right, c0.bottom,
+                            c0.ticker, hx, hy, True, c0.title_idx, c0.raw_slot, True,
+                        )
                         if (c0.left == cell.left and c0.top == cell.top and c0.ticker == cell.ticker) else c0
-                        for c0 in cached[3]
+                        for c0 in cached[4]
                     ]
-                    self._grid_cache[win.hwnd] = (cached[0], cached[1], cached[2], upd, cached[4], time.monotonic())
+                    self._grid_cache[win.hwnd] = (cached[0], cached[1], cached[2], cached[3], upd, cached[5], time.monotonic(), cached[7])
             return cell.ticker
         if other_hits:
+            record_trace(
+                f"TOS_GRID_INVALIDATED hwnd=0x{win.hwnd:X} expected={cell.ticker} saw={other_hits[0][2]}",
+                level="WARN",
+            )
             with self._lock:
                 self._grid_cache.pop(win.hwnd, None)
         return ""
 
     def _scan_grid_synchronously(
-        self, win: WindowInfo, title_tickers: list[str], sidecar: UiaOcrSidecar,
-        hud_exclude_rect: tuple[int, int, int, int] | None = None, abort_on_fg: bool = False,
+        self,
+        win: WindowInfo,
+        title_tickers: list[str],
+        sidecar: UiaOcrSidecar,
+        hud_exclude_rect: tuple[int, int, int, int] | None = None,
+        abort_on_fg: bool = False,
+        allow_full_sweep: bool = True,
+        raw_slots: list[str] | None = None,
+        force_rescan: bool = False,
     ) -> list[GridCellRect]:
-        if win.is_iconic or user32.IsIconic(win.hwnd) or not title_tickers:
+        whitelist = {s for s in title_tickers if s}
+        if win.is_iconic or user32.IsIconic(win.hwnd) or not title_tickers or not whitelist:
             return []
         wl, wt, ww, wh = win.rect
         if ww < 200 or wh < 120:
             return []
         t_tup = tuple(title_tickers)
+        raw_tup = tuple(raw_slots) if raw_slots is not None else t_tup
         with self._get_scan_lock(win.hwnd):
             if abort_on_fg and sidecar.is_foreground_waiting():
                 return []
             cur_occ = _sample_window_occlusion_mask(win.hwnd, win.rect)
-            with self._lock:
-                cached = self._grid_cache.get(win.hwnd)
-                if cached is not None and cached[0] == win.rect and cached[1] == win.dpi and cached[2] == t_tup:
-                    if (time.monotonic() - cached[5]) < 1.2 and (cached[4] & ~cur_occ) == 0:
-                        return cached[3]
+            if not force_rescan:
+                with self._lock:
+                    cached = self._grid_cache.get(win.hwnd)
+                    if cached is not None and cached[0] == win.rect and cached[1] == win.dpi and len(cached[2]) == len(t_tup):
+                        if cached[2] == t_tup and (time.monotonic() - cached[6]) < 1.2 and (cached[5] & ~cur_occ) == 0:
+                            return cached[4]
+                        if cached[7]:
+                            proj = self._project_cells_in_place(cached[4], t_tup, raw_tup)
+                            if proj is not None:
+                                self._grid_cache[win.hwnd] = (
+                                    win.rect, win.dpi, t_tup, raw_tup, proj, cached[5], cached[6], True,
+                                )
+                                return proj
 
             vis_rect = get_visible_frame_rect(win.hwnd, win.rect, win.is_zoomed)
             v_left, v_top, v_w, v_h = vis_rect
@@ -3521,7 +3991,6 @@ class TosGridCacheAndTracker:
             min_grid_y = v_top + int(40 * dpi_sc)
             nom_top_pad = int(56 * dpi_sc) if v_h >= int(420 * dpi_sc) else 0
             usable_h = max(80.0, float(v_h - nom_top_pad))
-            whitelist = set(title_tickers)
             max_dim = max(4096, int(sidecar.ocr_max_dim or 8192))
 
             strip_scale = 3 if (v_w * 3) <= max_dim else (2 if (v_w * 2) <= max_dim else 1)
@@ -3554,12 +4023,14 @@ class TosGridCacheAndTracker:
                 )
 
             clustered = _cluster_grid_ocr_candidates(raw_hits)
-            lattice = fit_verified_grid_lattice(win.rect, title_tickers, clustered, vis_rect=vis_rect, dpi=win.dpi)
+            lattice, layout_locked = fit_verified_grid_lattice_ex(
+                win.rect, title_tickers, clustered, vis_rect=vis_rect, dpi=win.dpi, raw_slots=raw_slots,
+            )
 
-            if lattice is not None and any(not c.verified for c in lattice):
+            if lattice is not None and any((not c.verified and bool(c.ticker)) for c in lattice):
                 miss_bands: list[tuple[int, int]] = []
                 for mc in lattice:
-                    if not mc.verified and is_rect_unoccluded_for_hwnd(win.hwnd, max(v_left, mc.left + 8), max(min_grid_y, mc.top), 140, 64)[0]:
+                    if not mc.verified and mc.ticker and is_rect_unoccluded_for_hwnd(win.hwnd, max(v_left, mc.left + 8), max(min_grid_y, mc.top), 140, 64)[0]:
                         my0 = max(min_grid_y, mc.top - int(18 * dpi_sc))
                         my1 = min(mc.bottom, my0 + int(235 * dpi_sc))
                         if my1 - my0 >= 36:
@@ -3584,11 +4055,13 @@ class TosGridCacheAndTracker:
                         added = True
                 if added:
                     clustered = _cluster_grid_ocr_candidates(raw_hits)
-                    lat2 = fit_verified_grid_lattice(win.rect, title_tickers, clustered, vis_rect=vis_rect, dpi=win.dpi)
+                    lat2, locked2 = fit_verified_grid_lattice_ex(
+                        win.rect, title_tickers, clustered, vis_rect=vis_rect, dpi=win.dpi, raw_slots=raw_slots,
+                    )
                     if lat2 is not None:
-                        lattice = lat2
+                        lattice, layout_locked = lat2, locked2
 
-            if lattice is None and len({c[2] for c in clustered}) < len(set(title_tickers)):
+            if allow_full_sweep and lattice is None and len({c[2] for c in clustered}) < len(whitelist):
                 fb_scale = 2 if (v_w * 2) <= max_dim else 1
                 band_h = min(v_h, min(880, max_dim // fb_scale))
                 overlap = int(105 * dpi_sc)
@@ -3610,72 +4083,309 @@ class TosGridCacheAndTracker:
                         break
                     y_scr += max(80, band_h - overlap)
                 clustered = _cluster_grid_ocr_candidates(raw_hits)
-                lattice = fit_verified_grid_lattice(win.rect, title_tickers, clustered, vis_rect=vis_rect, dpi=win.dpi)
+                lattice, layout_locked = fit_verified_grid_lattice_ex(
+                    win.rect, title_tickers, clustered, vis_rect=vis_rect, dpi=win.dpi, raw_slots=raw_slots,
+                )
 
             cells = lattice or []
             now_done = time.monotonic()
             with self._lock:
                 if not cells:
+                    if force_rescan:
+                        self._grid_cache.pop(win.hwnd, None)
                     bf = self._fail_backoff.get(win.hwnd)
                     prev_d = bf[3] if (bf is not None and bf[0] == win.rect and bf[1] == t_tup) else 0.0
                     next_d = min(18.0, 3.0 if prev_d <= 0.0 else prev_d * 2.0)
                     self._fail_backoff[win.hwnd] = (win.rect, t_tup, now_done + next_d, next_d)
                     return []
                 self._fail_backoff.pop(win.hwnd, None)
-                self._grid_cache[win.hwnd] = (win.rect, win.dpi, t_tup, cells, cur_occ, now_done)
+                self._grid_cache[win.hwnd] = (win.rect, win.dpi, t_tup, raw_tup, cells, cur_occ, now_done, bool(layout_locked))
             return cells
+
+    def _ocr_targeted_cursor_header(
+        self,
+        win: WindowInfo,
+        slots: list[str],
+        raw_slots: list[str],
+        trusted: bool,
+        cx: int,
+        cy: int,
+        sidecar: UiaOcrSidecar,
+        hud_exclude_rect: tuple[int, int, int, int] | None = None,
+    ) -> tuple[str, str, str]:
+        """
+        Fast ~120ms targeted header-crop OCR fallback when Pass 1 lattice couldn't lock
+        (e.g. non-uniform grid, sparse 1-slot ambiguity, or occluded siblings).
+        Treats `"0"` and non-equity stems as blocking headers so hovering an empty `'0'` tile
+        NEVER reads a ticker from the chart tile above it.
+        """
+        if win.is_iconic or user32.IsIconic(win.hwnd):
+            return "miss", "", "TOS grid window is minimized"
+        vis_rect = get_visible_frame_rect(win.hwnd, win.rect, win.is_zoomed)
+        v_left, v_top, v_w, v_h = vis_rect
+        dpi_sc = max(1.0, float(win.dpi or 96) / 96.0)
+        min_grid_y = v_top + int(40 * dpi_sc)
+        nom_top_pad = int(56 * dpi_sc) if v_h >= int(420 * dpi_sc) else 0
+        usable_h = max(80.0, float(v_h - nom_top_pad))
+
+        whitelist = {s for s in slots if s}
+        has_zero = any(r in ("", "0") for r in raw_slots) if raw_slots else False
+        non_eq_raw_map: dict[str, str] = {}
+        if raw_slots:
+            for idx_r, r_tok in enumerate(raw_slots):
+                eq_s = slots[idx_r] if idx_r < len(slots) else ""
+                if eq_s or r_tok in ("", "0"):
+                    continue
+                stem = r_tok.strip().lstrip("/$. ").split(":", 1)[0].split()[0].upper()
+                for cand_k in (stem, stem.split(".", 1)[0]):
+                    if cand_k and cand_k not in whitelist:
+                        non_eq_raw_map[cand_k] = r_tok
+
+        cand_dims = _candidate_grid_dims(len(slots), v_w, int(usable_h)) if (trusted and len(slots) >= 2) else []
+        crop_boxes: list[tuple[int, int, int, int]] = []
+
+        def _add_crop(bx: int, by: int, bw: int, bh: int) -> None:
+            bx = max(v_left, min(bx, (v_left + v_w) - 64))
+            by = max(min_grid_y, min(by, (win.rect[1] + win.rect[3]) - 32))
+            bw = min(int(560 * dpi_sc), max(60, bw), (v_left + v_w) - bx)
+            bh = min(int(200 * dpi_sc), max(32, bh), (win.rect[1] + win.rect[3]) - by)
+            if bw < 60 or bh < 28:
+                return
+            if any(abs(bx - ox) <= 35 and abs(by - oy) <= 35 and abs(bw - ow) <= 45 and abs(bh - oh) <= 45 for (ox, oy, ow, oh) in crop_boxes):
+                return
+            crop_boxes.append((bx, by, bw, bh))
+
+        with self._lock:
+            cached_stale = self._grid_cache.get(win.hwnd)
+        if cached_stale is not None:
+            for sc in cached_stale[4]:
+                if sc.left <= cx <= sc.right and sc.top <= cy <= sc.bottom:
+                    _add_crop(
+                        sc.left + 2,
+                        sc.top - int(16 * dpi_sc),
+                        int((sc.right - sc.left) * 0.60),
+                        int(125 * dpi_sc),
+                    )
+                    break
+
+        for rows, cols, _ in cand_dims[:3]:
+            nom_cw = float(v_w) / cols
+            nom_ch = usable_h / rows
+            cc = max(0, min(cols - 1, int((cx - v_left) / max(1.0, nom_cw))))
+            rr = max(0, min(rows - 1, int((cy - (v_top + nom_top_pad)) / max(1.0, nom_ch))))
+            c_l = int(v_left + cc * nom_cw)
+            c_t = max(min_grid_y, int(v_top + nom_top_pad + rr * nom_ch))
+            _add_crop(
+                c_l + 2,
+                c_t - int(18 * dpi_sc),
+                max(int(120 * dpi_sc), int(nom_cw * 0.55)),
+                max(int(72 * dpi_sc), int(nom_ch * 0.36)),
+            )
+
+        if not crop_boxes:
+            _add_crop(
+                cx - int(220 * dpi_sc),
+                cy - int(200 * dpi_sc),
+                int(480 * dpi_sc),
+                int(220 * dpi_sc),
+            )
+
+        own_pid = get_own_pid()
+        reject_commas = len(whitelist) > 1
+        candidates: list[tuple[float, str, str]] = []
+
+        def _collect_crop(ocr_res: dict, bx: int, by: int, pkey: str, ckey: str) -> None:
+            chr_lines = set(int(li) for li in (ocr_res.get(ckey) or []))
+            for item in ocr_res.get(pkey) or []:
+                if not isinstance(item, dict) or int(item.get("line_idx", -1)) in chr_lines:
+                    continue
+                rc = item.get("rect") or [0, 0, 0, 0]
+                if not (isinstance(rc, list) and len(rc) == 4):
+                    continue
+                wx_scr = int(bx + float(rc[0]))
+                wy_scr = int(by + float(rc[1]))
+                if wy_scr < min_grid_y or wy_scr > cy + int(18 * dpi_sc) or wx_scr > cx + int(90 * dpi_sc):
+                    continue
+                if hud_exclude_rect is not None:
+                    hl, ht, hr, hb = hud_exclude_rect
+                    if hl <= wx_scr <= hr and ht <= wy_scr <= hb:
+                        continue
+                ww_w, wh_w = max(4, int(float(rc[2]))), max(4, int(float(rc[3])))
+                if float(rc[3]) < 8.0 * dpi_sc:
+                    continue
+                widx = int(item.get("word_idx") or 0)
+                raw_text = str(item.get("text") or "").strip()
+
+                kind_hit = ""
+                val_hit = ""
+                if widx == 0:
+                    tok_blk = raw_text.strip("|,;[]()\"'▾▼•*$").upper()
+                    if has_zero and (raw_text.strip("|,;[]()\"'") == "0" or (tok_blk in ("0", "O") and tok_blk not in whitelist)):
+                        kind_hit, val_hit = "BLOCK", "0"
+                    elif non_eq_raw_map:
+                        stem_b = raw_text.lstrip("/$. ").split(":", 1)[0].strip("|,;[]()\"'").upper()
+                        if stem_b in non_eq_raw_map:
+                            kind_hit, val_hit = "BLOCK", non_eq_raw_map[stem_b]
+
+                if not kind_hit:
+                    if whitelist:
+                        sym = match_ocr_word_to_whitelist(
+                            raw_text, widx, (float(rc[2]), float(rc[3])), whitelist, reject_trailing_comma=reject_commas,
+                        )
+                    elif not trusted and widx == 0:
+                        sym = parse_strict_uppercase_ticker_token(raw_text)
+                        if sym and sym.split(".", 1)[0] in (_FREEFORM_OCR_STOPWORDS | _COMPANY_SUFFIX_NOISE):
+                            sym = ""
+                    else:
+                        sym = ""
+                    if sym:
+                        kind_hit, val_hit = "SYM", sym
+
+                if not kind_hit:
+                    continue
+                hit_pt = wintypes.POINT(wx_scr + ww_w // 2, wy_scr + wh_w // 2)
+                h_at = user32.WindowFromPoint(hit_pt)
+                r_at = int(user32.GetAncestor(h_at, GA_ROOT) or 0) if h_at else 0
+                if r_at != win.hwnd and (not r_at or get_hwnd_pid(r_at) != own_pid):
+                    continue
+                score = abs(float(cy - wy_scr)) + 0.15 * max(0.0, float(cx - wx_scr))
+                candidates.append((score, kind_hit, val_hit))
+
+        for bx, by, bw, bh in crop_boxes[:2]:
+            ob = sidecar.ocr_screen_rect(int(bx), int(by), int(bw), int(bh), scale=3, mode="both", timeout=1.6)
+            if ob.get("ok"):
+                _collect_crop(ob, bx, by, "words_inverted", "chrome_inverted")
+                _collect_crop(ob, bx, by, "words_normal", "chrome_normal")
+            if candidates:
+                break
+
+        if not candidates:
+            return "miss", "", "Couldn't read hovered TOS tile — bring grid to front & retry"
+
+        candidates.sort(key=lambda t: t[0])
+        _, top_kind, top_val = candidates[0]
+        if top_kind == "BLOCK":
+            return "empty", "", describe_empty_or_nonequity_slot(top_val)
+
+        if trusted and cand_dims and whitelist:
+            sym_ok_in_any_layout = False
+            for rows, cols, _ in cand_dims:
+                nom_cw = float(v_w) / cols
+                nom_ch = usable_h / rows
+                cc = max(0, min(cols - 1, int((cx - v_left) / max(1.0, nom_cw))))
+                rr = max(0, min(rows - 1, int((cy - (v_top + nom_top_pad)) / max(1.0, nom_ch))))
+                idx_rm = rr * cols + cc
+                idx_cm = cc * rows + rr
+                if (idx_rm < len(slots) and slots[idx_rm] == top_val) or (idx_cm < len(slots) and slots[idx_cm] == top_val):
+                    sym_ok_in_any_layout = True
+                    break
+            if not sym_ok_in_any_layout:
+                return "miss", "", "Couldn't read hovered TOS tile — bring grid to front & retry"
+
+        return "hit", top_val, f"{top_val} ← TOS OCR ✓"
+
+    def resolve_grid_at_cursor_ex(
+        self,
+        win: WindowInfo,
+        cursor_pt: tuple[int, int] | None,
+        sidecar: UiaOcrSidecar | None,
+        hud_exclude_rect: tuple[int, int, int, int] | None = None,
+        require_ocr_confirm: bool = False,
+    ) -> tuple[str, str, str]:
+        """
+        3-state interactive hover resolver: returns `(state, ticker, detail)`
+        where `state` is `"hit"`, `"empty"`, or `"miss"`.
+        NEVER runs a multi-second full-window Pass 2 vertical sweep inside the worker lock.
+        """
+        if win.is_iconic:
+            return "miss", "", "TOS grid window is minimized"
+        t_list, diff_sym, diff_age = self.observe_tos_window(win)
+        raw_slots, trusted = extract_tos_raw_title_slots(win.title)
+        if not t_list and trusted and not raw_slots:
+            return "miss", "", ""
+
+        sc_state, sc_sym, sc_msg = self._check_single_chart_shortcut(t_list, raw_slots, trusted)
+        if sc_state in ("hit", "empty"):
+            return sc_state, sc_sym, sc_msg
+
+        if cursor_pt is None:
+            return "miss", "", "Point cursor at a TOS chart tile"
+        cx, cy = int(cursor_pt[0]), int(cursor_pt[1])
+        wl, wt, ww, wh = win.rect
+        if not (wl <= cx <= wl + ww and wt <= cy <= wt + wh):
+            if diff_sym and diff_age <= 4.0 and not self.is_recent_own_push(diff_sym, 10.0):
+                return "hit", diff_sym, f"{diff_sym} ← TOS Grid (typed) ✓"
+            return "miss", "", "Cursor outside TOS grid"
+
+        t_tup = tuple(t_list)
+        raw_tup = tuple(raw_slots)
+        unver_cell: GridCellRect | None = None
+
+        if trusted and t_list:
+            with self._lock:
+                self._fail_backoff.pop(win.hwnd, None)
+                cached = self._grid_cache.get(win.hwnd)
+                if cached is not None and cached[0] == win.rect and cached[1] == win.dpi and len(cached[2]) == len(t_tup):
+                    cells = cached[4]
+                    if cached[2] != t_tup or cached[3] != raw_tup:
+                        if cached[7]:
+                            proj = self._project_cells_in_place(cells, t_tup, raw_tup)
+                            if proj is not None:
+                                cells = proj
+                                self._grid_cache[win.hwnd] = (
+                                    cached[0], cached[1], t_tup, raw_tup, cells, cached[5], cached[6], True,
+                                )
+                            else:
+                                cells = []
+                        else:
+                            cells = []
+                    for c in cells:
+                        if c.left <= cx <= c.right and c.top <= cy <= c.bottom:
+                            if c.verified:
+                                if not c.ticker:
+                                    return "empty", "", describe_empty_or_nonequity_slot(c.raw_slot)
+                                if not require_ocr_confirm or c.ocr_confirmed:
+                                    return "hit", c.ticker, f"{c.ticker} ← TOS Grid ✓"
+                            unver_cell = c
+                            break
+
+        if sidecar is None:
+            return "miss", "", "OCR sidecar unavailable"
+
+        force_scan = False
+        if unver_cell is not None and unver_cell.ticker:
+            sym = self._verify_or_invalidate_cell_sync(win, t_list, unver_cell, sidecar, hud_exclude_rect)
+            if sym:
+                return "hit", sym, f"{sym} ← TOS Grid ✓"
+            force_scan = True
+
+        if trusted and t_list and any(t_list):
+            cells = self._scan_grid_synchronously(
+                win, t_list, sidecar, hud_exclude_rect,
+                abort_on_fg=False, allow_full_sweep=False, raw_slots=raw_slots, force_rescan=force_scan,
+            )
+            for sc in cells:
+                if sc.left <= cx <= sc.right and sc.top <= cy <= sc.bottom:
+                    if sc.verified:
+                        if not sc.ticker:
+                            return "empty", "", describe_empty_or_nonequity_slot(sc.raw_slot)
+                        if not require_ocr_confirm or sc.ocr_confirmed:
+                            return "hit", sc.ticker, f"{sc.ticker} ← TOS Grid ✓"
+                    if sc.ticker:
+                        sym2 = self._verify_or_invalidate_cell_sync(win, t_list, sc, sidecar, hud_exclude_rect)
+                        if sym2:
+                            return "hit", sym2, f"{sym2} ← TOS Grid ✓"
+
+        return self._ocr_targeted_cursor_header(
+            win, t_list, raw_slots, trusted, cx, cy, sidecar, hud_exclude_rect=hud_exclude_rect,
+        )
 
     def resolve_grid_at_cursor(
         self, win: WindowInfo, cursor_pt: tuple[int, int] | None, sidecar: UiaOcrSidecar | None,
         hud_exclude_rect: tuple[int, int, int, int] | None = None,
     ) -> tuple[str, str]:
-        if win.is_iconic:
-            return "", "TOS grid window is minimized"
-        t_list, diff_sym, diff_age = self.observe_tos_window(win)
-        if not t_list:
-            return "", ""
-        if len(set(t_list)) == 1:
-            return t_list[0], f"{t_list[0]} ← TOS Chart ✓"
-        if cursor_pt is None:
-            return "", "Point cursor at a TOS chart tile"
-        cx, cy = int(cursor_pt[0]), int(cursor_pt[1])
-        wl, wt, ww, wh = win.rect
-        if not (wl <= cx <= wl + ww and wt <= cy <= wt + wh):
-            if diff_sym and diff_age <= 4.0 and not self.is_recent_own_push(diff_sym, 10.0):
-                return diff_sym, f"{diff_sym} ← TOS Grid (typed) ✓"
-            return "", "Cursor outside TOS grid"
-
-        t_tup = tuple(t_list)
-        with self._lock:
-            self._fail_backoff.pop(win.hwnd, None)
-            cached = self._grid_cache.get(win.hwnd)
-            if cached is not None and cached[0] == win.rect and cached[1] == win.dpi and cached[2] == t_tup:
-                for c in cached[3]:
-                    if c.left <= cx <= c.right and c.top <= cy <= c.bottom:
-                        if c.verified:
-                            return c.ticker, f"{c.ticker} ← TOS Grid ✓"
-                        unver_cell = c
-                        break
-                else:
-                    unver_cell = None
-            else:
-                unver_cell = None
-
-        if sidecar is None:
-            return "", "OCR sidecar unavailable"
-        if unver_cell is not None:
-            sym = self._verify_or_invalidate_cell_sync(win, t_list, unver_cell, sidecar, hud_exclude_rect)
-            if sym:
-                return sym, f"{sym} ← TOS Grid ✓"
-        cells = self._scan_grid_synchronously(win, t_list, sidecar, hud_exclude_rect, abort_on_fg=False)
-        for sc in cells:
-            if sc.left <= cx <= sc.right and sc.top <= cy <= sc.bottom:
-                if sc.verified:
-                    return sc.ticker, f"{sc.ticker} ← TOS Grid ✓"
-                sym2 = self._verify_or_invalidate_cell_sync(win, t_list, sc, sidecar, hud_exclude_rect)
-                if sym2:
-                    return sym2, f"{sym2} ← TOS Grid ✓"
-        return "", "Couldn't read hovered TOS tile — bring grid to front & retry"
+        _, sym, det = self.resolve_grid_at_cursor_ex(win, cursor_pt, sidecar, hud_exclude_rect=hud_exclude_rect)
+        return sym, det
 
     def format_grid_diagnostics(self, wins: list[WindowInfo]) -> list[str]:
         lines: list[str] = []
@@ -3689,11 +4399,18 @@ class TosGridCacheAndTracker:
             lines.append("- (No cached TOS Flexible Grid layouts yet)")
             return lines
         now = time.monotonic()
-        for hwnd, (wrect, wdpi, t_tup, cells, occ_mask, scan_ts) in items:
-            wt = redact_sensitive_text(by_hwnd[hwnd].title) if hwnd in by_hwnd else f"hwnd={hwnd}"
-            lines.append(f"- Grid hwnd={hwnd} ({wt}) | rect={wrect} dpi={wdpi} occ=0x{occ_mask:04x} age={now - scan_ts:.1f}s | titles={list(t_tup)}")
+        for hwnd, (wrect, wdpi, t_tup, raw_tup, cells, occ_mask, scan_ts, locked) in items:
+            wt = redact_sensitive_text(by_hwnd[hwnd].title) if hwnd in by_hwnd else f"hwnd=0x{hwnd:X}"
+            lines.append(
+                f"- Grid hwnd=0x{hwnd:X} ({wt}) | rect={wrect} dpi={wdpi} locked={locked} "
+                f"occ=0x{occ_mask:04x} age={now - scan_ts:.1f}s | slots={list(raw_tup or t_tup)}"
+            )
             for ci, c in enumerate(cells):
-                lines.append(f"    [{ci}] {c.ticker} (tidx={c.title_idx}, ver={c.verified}) rect=({c.left},{c.top},{c.right},{c.bottom})")
+                lbl = c.ticker if c.ticker else (f"EMPTY({c.raw_slot or '0'})")
+                lines.append(
+                    f"    [{ci}] {lbl} (tidx={c.title_idx}, ver={c.verified}, conf={c.ocr_confirmed}) "
+                    f"rect=({c.left},{c.top},{c.right},{c.bottom})"
+                )
         return lines
 
 
@@ -4219,13 +4936,26 @@ def build_ai_diagnostics_report(
     grid_tracker: TosGridCacheAndTracker | None,
     bm_subscribed_tabs: list[str],
     error_log_path: str,
+    *,
+    staged_ticker: str = "",
+    last_status: str = "",
+    worker_busy: bool = False,
+    pending_action: str = "",
+    events_log_path: str = "",
+    crash_log_path: str = "",
 ) -> str:
+    """
+    Builds a scrubbed markdown diagnostics snapshot. Strictly read-only: NEVER spawns
+    `sidecar` if idle and NEVER calls any Tkinter widget methods (safe from background threads).
+    """
     lines: list[str] = []
     lines.append(f"# TI Ticker Deep-Dive v{app_version} — AI Diagnostics Snapshot")
     lines.append(f"- Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"- Process Elevated (Admin): {is_current_process_elevated()}")
     lines.append(f"- DPI Awareness Mode: {dpi_mode}")
     lines.append(f"- Mouse Buttons Swapped (SM_SWAPBUTTON): {is_primary_mouse_swapped()}")
+    lines.append(f"- Staged Ticker: {staged_ticker or '(none)'} | Last Status: {redact_sensitive_text(last_status or '(ready)')}")
+    lines.append(f"- Worker Queue: busy={bool(worker_busy)} | pending={pending_action or '(none)'}")
     lines.append(f"- Webull Integration Enabled: {bool(config.get('webull_enabled', False))}")
     lines.append(f"- Promote to Main Mode: {config.get('promote_tos_mode', 'main_only')}")
     lines.append(f"- Clipboard Policy: {config.get('clipboard_after_deep_dive', 'keep_ticker')}")
@@ -4236,9 +4966,10 @@ def build_ai_diagnostics_report(
         )
     lines.append(f"- Hotkeys: {hotkey_statuses}")
     lines.append("")
-    lines.append("## Visible Relevant Windows (Account Numbers & Usernames Scrubbed)")
+    lines.append("## Visible Relevant Windows (Account Numbers, Usernames, Emails & Non-DT Tabs Scrubbed)")
 
     webull_on = bool(config.get("webull_enabled", False))
+    dt_hint = str(config.get("dt_tab_title_hint") or "dilution").strip().lower()
     wins = enum_visible_top_windows()
     relevant: list[tuple[str, WindowInfo]] = []
     for w in wins:
@@ -4252,11 +4983,16 @@ def build_ai_diagnostics_report(
         lines.append("- (No visible TOS, Bookmap, Browser" + (", or Webull" if webull_on else "") + " windows)")
     else:
         for k, w in relevant:
-            norm_t = normalize_window_title(w.title, k)
+            if k == "browser" and dt_hint and dt_hint not in w.title.lower():
+                t_disp = "<non-DT browser tab>"
+                n_disp = "<non-DT browser tab>"
+            else:
+                t_disp = redact_sensitive_text(w.title)
+                n_disp = redact_sensitive_text(normalize_window_title(w.title, k))
             lines.append(
-                f"- [{k.upper()}] exe={w.exe_name!r} | elevated={w.is_elevated} | dpi={w.dpi} | "
+                f"- [{k.upper()}] hwnd=0x{w.hwnd:X} exe={w.exe_name!r} | elevated={w.is_elevated} | dpi={w.dpi} | "
                 f"zoomed={w.is_zoomed} | iconic={w.is_iconic} | rect={w.rect} | "
-                f"title={redact_sensitive_text(w.title)!r} (norm={redact_sensitive_text(norm_t)!r})"
+                f"title={t_disp!r} (norm={n_disp!r})"
             )
 
     if grid_tracker is not None:
@@ -4265,8 +5001,8 @@ def build_ai_diagnostics_report(
         lines.extend(grid_tracker.format_grid_diagnostics(wins))
 
     lines.append("")
-    lines.append("## Recent Automation Trace (Last 50 Events)")
     traces = get_recent_traces()
+    lines.append(f"## Recent Automation Trace (Last {len(traces)} Events)")
     if not traces:
         lines.append("  (No runs yet in this session)")
     else:
@@ -4285,5 +5021,12 @@ def build_ai_diagnostics_report(
             lines.append(f"  (Could not read error.log: {e})")
     else:
         lines.append("  (No errors logged)")
+
+    if events_log_path:
+        lines.append("")
+        lines.append(f"## Persistent Log Files")
+        lines.append(f"- automation_events.log: {redact_sensitive_text(events_log_path)} (exists={os.path.isfile(events_log_path)})")
+        if crash_log_path:
+            lines.append(f"- crash.log: {redact_sensitive_text(crash_log_path)} (exists={os.path.isfile(crash_log_path)})")
 
     return redact_sensitive_text("\n".join(lines))

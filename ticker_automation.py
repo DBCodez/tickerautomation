@@ -29,6 +29,7 @@ import calendar
 import copy
 import ctypes
 from ctypes import wintypes
+import faulthandler
 import gzip
 import json
 import math
@@ -72,6 +73,9 @@ from deepdive_engine import (
     SW_RESTORE,
     GA_ROOT,
     set_error_log_callback,
+    configure_event_log,
+    flush_event_log,
+    write_live_diagnostics_atomic,
     record_trace,
     enable_per_monitor_dpi_awareness,
     per_monitor_dpi_context,
@@ -125,6 +129,8 @@ from deepdive_engine import (
     push_ticker_to_tos_main,
     push_ticker_to_webull,
     grab_ticker_from_webull_ex,
+    extract_tos_raw_title_slots,
+    extract_tos_title_slots,
     extract_tos_title_tickers,
     TosGridCacheAndTracker,
     grab_tos_2pass,
@@ -137,13 +143,17 @@ from deepdive_engine import (
 )
 
 
-APP_VERSION = "3.0"
+APP_VERSION = "3.0.1"
 CONFIG_SCHEMA_VERSION = 3
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ERROR_LOG_PATH = os.path.join(SCRIPT_DIR, "error.log")
+LIVE_DIAGNOSTICS_PATH = os.path.join(SCRIPT_DIR, "live_diagnostics.md")
+AUTOMATION_EVENTS_LOG_PATH = os.path.join(SCRIPT_DIR, "automation_events.log")
+CRASH_LOG_PATH = os.path.join(SCRIPT_DIR, "crash.log")
 SIDECAR_PS1_PATH = os.path.join(SCRIPT_DIR, "uia_ocr_bridge.ps1")
+_CRASH_LOG_FH = None
 
 HOTKEY_ID_DEEP_DIVE = 101
 HOTKEY_ID_HOVER_DD = 102
@@ -166,6 +176,11 @@ def log_error(context: str, exc: BaseException | None = None) -> None:
             if exc is not None:
                 f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
             f.write("\n")
+    except Exception:
+        pass
+    try:
+        detail = f"{context}: {type(exc).__name__}: {exc}" if exc is not None else context
+        record_trace(f"ERROR {detail}", level="ERROR")
     except Exception:
         pass
 
@@ -458,6 +473,18 @@ class TickerAutomationApp:
         self._coach_pid_cache: dict[int, tuple[str, str]] = {}
         self.hotkey_statuses: dict[int, tuple[bool, str]] = {}
 
+        # Thread-safe plain-attribute mirror & debounced auto-diagnostics writer (no off-thread Tk calls)
+        self._diag_last_status: str = f"v{APP_VERSION} Ready • TI / TOS"
+        self._diag_staged_ticker: str = ""
+        self._diag_pending_action: str = ""
+        self._diag_dirty: bool = False
+        self._diag_wake = threading.Event()
+        configure_event_log(AUTOMATION_EVENTS_LOG_PATH)
+        self._diag_thread = threading.Thread(
+            target=self._live_diagnostics_loop, daemon=True, name="LiveDiagnosticsWriter"
+        )
+        self._diag_thread.start()
+
         try:
             user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, ctypes.c_void_p(0), 0)
         except Exception:
@@ -471,6 +498,9 @@ class TickerAutomationApp:
         self._register_all_hotkeys()
         self._schedule_entry_poll()
         self.root.after(1100, self._schedule_background_grid_warmup)
+        record_trace(f"APP_START v{APP_VERSION} dpi={self.dpi_mode}")
+        self._request_live_diagnostics_refresh()
+        self.root.after(2600, self._request_live_diagnostics_refresh)
 
     # --------------------------------------------------------------------------
     # Configuration Persistence
@@ -1226,6 +1256,8 @@ class TickerAutomationApp:
                 msg for _, (ok, msg) in self.hotkey_statuses.items()
                 if not ok and msg not in ("Off", "")
             ]
+            record_trace("SETTINGS_SAVED" + (f" warn={bad_hk[0]}" if bad_hk else ""))
+            self._request_live_diagnostics_refresh()
             if bad_hk:
                 self.set_status(f"Saved (note: {bad_hk[0]})", THEME["fg_warning"])
             else:
@@ -1365,7 +1397,7 @@ class TickerAutomationApp:
                 if root_hwnd != anchor_hwnd or math.hypot(cx - anchor_x, cy - anchor_y) > COACH_ANCHOR_RADIUS_PX or steady_since is None:
                     anchor_x, anchor_y, anchor_hwnd, steady_since = cx, cy, root_hwnd, now
                 rem = max(0.0, COACH_HOLD_SEC - (now - steady_since))
-                note = " (pick MAIN chart, not grid!)" if (expected_kind == "tos" and len(extract_tos_title_tickers(cur_title)) > 1) else ""
+                note = " (pick MAIN chart, not grid!)" if (expected_kind == "tos" and len(extract_tos_title_slots(cur_title)) > 1) else ""
                 if rem <= 0.0:
                     self._finish_hold_still_pick(pick_kind, cx, cy, anchor_hwnd, cur_title)
                     return
@@ -1467,12 +1499,55 @@ class TickerAutomationApp:
             self.set_status(f"Webull Box ({rel_x},{rel_y}) ✓", THEME["fg_success"])
 
         self.save_config()
+        record_trace(f"PICK_SAVED kind={pick_kind} rel=({rel_x},{rel_y}) title={norm_t if pick_kind == 'tos' else raw_title[:24]!r}")
+        self._request_live_diagnostics_refresh()
+
+    def _build_current_diagnostics_report(self) -> str:
+        return build_ai_diagnostics_report(
+            APP_VERSION,
+            self.config,
+            self.dpi_mode,
+            self.sidecar,
+            self.hotkey_statuses,
+            self.grid_tracker,
+            list(self._bm_subscribed_tabs),
+            ERROR_LOG_PATH,
+            staged_ticker=self._diag_staged_ticker,
+            last_status=self._diag_last_status,
+            worker_busy=bool(self._worker_busy),
+            pending_action=self._diag_pending_action,
+            events_log_path=AUTOMATION_EVENTS_LOG_PATH,
+            crash_log_path=CRASH_LOG_PATH,
+        )
+
+    def _write_live_diagnostics_now(self) -> bool:
+        try:
+            report = self._build_current_diagnostics_report()
+            return write_live_diagnostics_atomic(LIVE_DIAGNOSTICS_PATH, report)
+        except Exception:
+            return False
+
+    def _request_live_diagnostics_refresh(self) -> None:
+        if self._closing:
+            return
+        self._diag_dirty = True
+        self._diag_wake.set()
+
+    def _live_diagnostics_loop(self) -> None:
+        while not self._closing:
+            self._diag_wake.wait(timeout=2.0)
+            self._diag_wake.clear()
+            if self._closing:
+                break
+            time.sleep(0.35)
+            if self._closing or not self._diag_dirty:
+                continue
+            self._diag_dirty = False
+            self._write_live_diagnostics_now()
 
     def _copy_diagnostics_to_clipboard(self) -> None:
-        report = build_ai_diagnostics_report(
-            APP_VERSION, self.config, self.dpi_mode, self.sidecar,
-            self.hotkey_statuses, self.grid_tracker, self._bm_subscribed_tabs, ERROR_LOG_PATH,
-        )
+        report = self._build_current_diagnostics_report()
+        write_live_diagnostics_atomic(LIVE_DIAGNOSTICS_PATH, report)
         ok, _ = write_clipboard_unicode(report, exclude_from_history=True)
         if ok:
             self.set_status("Copied AI Diagnostics to clipboard ✓", THEME["fg_success"])
@@ -1708,6 +1783,7 @@ class TickerAutomationApp:
         return self.staged_ticker
 
     def _update_staged_ui(self, ticker: str) -> None:
+        self._diag_staged_ticker = str(ticker or "")
         if ticker:
             self.staged_var.set(f"Staged: {ticker}")
             if not self._is_running_sequence:
@@ -1724,6 +1800,7 @@ class TickerAutomationApp:
         self._unselected_idle_prefix = ""
         self._entry_burst_armed_for_overwrite = True
         self.staged_ticker = ticker
+        self._diag_staged_ticker = ticker
         if self.edit_hwnd:
             set_window_text(self.edit_hwnd, ticker)
             self._last_raw_entry_text = ticker
@@ -1793,6 +1870,8 @@ class TickerAutomationApp:
             self.root.after(25, self._schedule_entry_poll)
 
     def set_status(self, message: str, color: str = THEME["fg_secondary"]) -> None:
+        self._diag_last_status = str(message or "")
+
         def _apply():
             if not self._closing:
                 self.status_var.set(message)
@@ -1809,13 +1888,15 @@ class TickerAutomationApp:
     # --------------------------------------------------------------------------
     # Pure-Win32 Hotkey Matrix & Press-Time Hover Snapshot
     # --------------------------------------------------------------------------
-    def _capture_press_snapshot(self, cursor_pt: tuple[int, int] | None, _fg_at_press: int) -> tuple[int, str, str, str]:
+    def _capture_press_snapshot(
+        self, cursor_pt: tuple[int, int] | None, _fg_at_press: int
+    ) -> tuple[int, str, str, str, str, bool, str]:
         if cursor_pt is None:
-            return 0, "", "", ""
+            return 0, "", "", "", "miss", False, ""
         hit = user32.WindowFromPoint(wintypes.POINT(int(cursor_pt[0]), int(cursor_pt[1])))
         root_c = int(user32.GetAncestor(hit, GA_ROOT) or 0) if hit else 0
         if not root_c or root_c == self._top_hwnd or root_c == self._settings_hwnd:
-            return root_c, "", "", ""
+            return root_c, "", "", "", "miss", False, ""
         pid = get_hwnd_pid(root_c)
         from deepdive_engine import get_pid_info_and_elevation
         exe_base, exe_full, _ = get_pid_info_and_elevation(pid)
@@ -1823,9 +1904,14 @@ class TickerAutomationApp:
         title = get_window_text(root_c).strip()
         kind = classify_exe_and_class(exe_base, exe_full, cls, include_webull=bool(self.config.get("webull_enabled", False)))
         cached_sym = ""
+        lookup_state = "miss"
+        ocr_conf = False
+        snap_det = ""
         if kind == "tos":
-            cached_sym = self.grid_tracker.fast_lookup_at_press(root_c, title, int(cursor_pt[0]), int(cursor_pt[1]))
-        return root_c, kind, title, cached_sym
+            lookup_state, cached_sym, snap_det, ocr_conf = self.grid_tracker.fast_lookup_at_press_ex(
+                root_c, title, int(cursor_pt[0]), int(cursor_pt[1])
+            )
+        return root_c, kind, title, cached_sym, lookup_state, ocr_conf, snap_det
 
     def _register_all_hotkeys(self) -> None:
         webull_on = bool(self.config.get("webull_enabled", False))
@@ -1885,8 +1971,13 @@ class TickerAutomationApp:
                 hud_r = self._own_hud_rect()
                 for w in wins:
                     if classify_exe_and_class(w.exe_name, w.exe_path, w.class_name, include_webull=False) == "tos":
-                        if not w.is_iconic and len(extract_tos_title_tickers(w.title)) > 1:
+                        if w.is_iconic:
+                            continue
+                        slots = extract_tos_title_slots(w.title)
+                        if len(slots) > 1 and any(slots):
                             self.grid_tracker.schedule_warmup_scan(w, self.sidecar, hud_exclude_rect=hud_r)
+                        else:
+                            self.grid_tracker.observe_tos_window(w)
             except Exception:
                 pass
 
@@ -1914,7 +2005,7 @@ class TickerAutomationApp:
         extra_vks: tuple[int, ...] = (),
         fg_at_press: int = 0,
         cursor_pt: tuple[int, int] | None = None,
-        snap: tuple[int, str, str, str] | None = None,
+        snap: tuple | None = None,
     ) -> None:
         if self._coach_active or self._bind_target_key is not None:
             self.set_status("Finish or cancel Pick/Bind first!", THEME["fg_warning"])
@@ -1928,7 +2019,7 @@ class TickerAutomationApp:
             "extra_vks": tuple(extra_vks),
             "fg_at_press": fg_at_press,
             "cursor_pt": cursor_pt,
-            "snap": snap or (0, "", "", ""),
+            "snap": snap or (0, "", "", "", "miss", False, ""),
             "queued_at": time.monotonic(),
         }
         with self._queue_lock:
@@ -1942,9 +2033,12 @@ class TickerAutomationApp:
             ):
                 return
             self._pending_job = req
+            self._diag_pending_action = action
             if old is not None and old["action"] != req["action"]:
+                record_trace(f"QUEUE_SUPERSEDED new={action} old={old['action']} ({source})", level="WARN")
                 self.set_status(f"⚡ Queued {action} (replaced {old['action']})", THEME["fg_warning"])
             else:
+                record_trace(f"QUEUE_BUSY queued={action} ({source})", level="WARN")
                 self.set_status(f"⚡ Busy — queued {action}...", THEME["fg_warning"])
 
     def _worker_loop(self, initial_req: dict) -> None:
@@ -1957,33 +2051,57 @@ class TickerAutomationApp:
                         self._execute_job_locked(cur)
                     finally:
                         self._is_running_sequence = False
+                        self._request_live_diagnostics_refresh()
                 with self._queue_lock:
                     nxt = self._pending_job
                     self._pending_job = None
-                    if nxt is not None and not self._closing and (time.monotonic() - float(nxt.get("queued_at") or 0.0)) <= 2.5:
-                        cur = nxt
+                    self._diag_pending_action = ""
+                    if nxt is not None and not self._closing:
+                        age = time.monotonic() - float(nxt.get("queued_at") or 0.0)
+                        ttl = 1.8 if nxt.get("action") == "promote_tos" else 2.5
+                        if age <= ttl:
+                            cur = nxt
+                        else:
+                            act_n = str(nxt.get("action") or "action")
+                            record_trace(
+                                f"QUEUE_EXPIRED action={act_n} age={age:.2f}s ttl={ttl:.1f}s ({nxt.get('source')})",
+                                level="WARN",
+                            )
+                            self.set_status(f"⏱ Dropped stale {act_n} ({age:.1f}s)", THEME["fg_warning"])
+                            cur = None
+                            self._worker_busy = False
                     else:
                         cur = None
                         self._worker_busy = False
         finally:
             with self._queue_lock:
                 self._pending_job = None
+                self._diag_pending_action = ""
                 self._worker_busy = False
+            self._request_live_diagnostics_refresh()
 
-    def _resolve_hover_chart_ticker(
+    def _resolve_hover_chart_ticker_ex(
         self,
         job: dict,
         wins: list[WindowInfo],
         *,
         for_promote_tos: bool = False,
-    ) -> tuple[str, str, int, bool]:
+    ) -> tuple[str, str, int, bool, str]:
         """
-        Resolves the ticker under the press-time cursor snapshot `(root_c, kind_c, title_c, cached_sym)`:
+        Resolves the ticker under the press-time cursor snapshot
+        `(root_c, kind_c, title_c, cached_sym, lookup_state, ocr_conf, snap_det)`:
           - Never falls back to `staged_ticker` if the cursor is over a non-Main TOS grid or Webull chart!
-          - Returns `(ticker, detail_msg, src_hwnd, used_staged_fallback)`.
+          - Returns `(ticker, detail_msg, src_hwnd, used_staged_fallback, lookup_state)`
+            where `lookup_state` is `"hit"`, `"empty"`, `"miss"`, or `"main"`.
         """
-        snap = job.get("snap") or (0, "", "", "")
-        root_c, kind_c, title_c, cached_sym = snap
+        snap = job.get("snap") or (0, "", "", "", "miss", False, "")
+        root_c = int(snap[0] or 0)
+        kind_c = str(snap[1] or "")
+        title_c = str(snap[2] or "")
+        cached_sym = str(snap[3] or "")
+        lookup_state = str(snap[4] or "miss") if len(snap) >= 5 else ("hit" if cached_sym else "miss")
+        ocr_conf = bool(snap[5]) if len(snap) >= 6 else bool(cached_sym)
+        snap_det = str(snap[6] or "") if len(snap) >= 7 else ""
         cursor_pt = job.get("cursor_pt")
         by_hwnd = {w.hwnd: w for w in wins}
         cal_win, _ = find_target_window(
@@ -1993,56 +2111,79 @@ class TickerAutomationApp:
         cal_hwnd = cal_win.hwnd if cal_win is not None else 0
 
         if kind_c == "tos":
-            is_grid_or_detached = bool(extract_tos_title_tickers(title_c)) or (cal_hwnd and root_c != cal_hwnd)
+            raw_slots_c, trusted_c = extract_tos_raw_title_slots(title_c)
+            is_grid_or_detached = bool(raw_slots_c) or (not trusted_c) or (cal_hwnd and root_c != cal_hwnd)
             if is_grid_or_detached:
-                if cached_sym:
-                    return cached_sym, f"{cached_sym} ← TOS Grid ✓", root_c, False
+                if lookup_state == "empty":
+                    return "", (snap_det or "Hovered TOS chart slot is empty ('0')"), root_c, False, "empty"
+                if lookup_state == "hit" and cached_sym and (not for_promote_tos or ocr_conf):
+                    return cached_sym, (snap_det or f"{cached_sym} ← TOS Grid ✓"), root_c, False, "hit"
                 win_obj = by_hwnd.get(root_c)
                 if win_obj is None:
-                    return "", "Hovered TOS window closed", root_c, False
-                sym, det = self.grid_tracker.resolve_grid_at_cursor(
-                    win_obj, cursor_pt, self.sidecar, hud_exclude_rect=self._own_hud_rect()
+                    return "", "Hovered TOS window closed", root_c, False, "miss"
+                st_g, sym, det = self.grid_tracker.resolve_grid_at_cursor_ex(
+                    win_obj, cursor_pt, self.sidecar,
+                    hud_exclude_rect=self._own_hud_rect(),
+                    require_ocr_confirm=for_promote_tos,
                 )
-                return sym, det, root_c, False
+                return sym, det, root_c, False, st_g
 
             # Cursor is over Main@thinkorswim
             if for_promote_tos:
                 staged = self._read_staged_and_rearm_on_main_thread()
                 if staged:
-                    return staged, f"Staged {staged}", root_c, True
-                return "", "No staged ticker to send to Main TOS!", root_c, True
+                    return staged, f"Staged {staged}", root_c, True, "hit"
+                return "", "No staged ticker to send to Main TOS!", root_c, True, "miss"
 
             sym_m, det_m, _ = grab_tos_2pass(
                 self.config, root_c, self._last_tos_clicked_hwnd, self._top_hwnd, cal_hwnd
             )
-            return sym_m, det_m, root_c, False
+            return sym_m, det_m, root_c, False, ("hit" if sym_m else "miss")
 
         if kind_c == "webull" and bool(self.config.get("webull_enabled", False)) and bool(self.config.get("webull_allow_hover_source", True)):
             win_obj = by_hwnd.get(root_c)
             sym_w, det_w = grab_ticker_from_webull_ex(
                 self.config, self.sidecar, all_windows=wins, source_win=win_obj, cursor_pt=cursor_pt
             )
-            return sym_w, det_w, root_c, False
+            return sym_w, det_w, root_c, False, ("hit" if sym_w else "miss")
 
         if for_promote_tos:
             staged = self._read_staged_and_rearm_on_main_thread()
             if staged:
-                return staged, f"Staged {staged}", 0, True
-            return "", "Point at a TOS grid tile or stage a ticker first!", 0, True
+                return staged, f"Staged {staged}", 0, True, "hit"
+            return "", "Point at a TOS grid tile or stage a ticker first!", 0, True, "miss"
 
         # Fallback: check if foreground TOS grid had a fresh title change (<3.5s)
         fg_win = by_hwnd.get(int(job.get("fg_at_press") or 0))
         if fg_win is not None and not fg_win.is_iconic and classify_exe_and_class(fg_win.exe_name, fg_win.exe_path, fg_win.class_name) == "tos":
             _, diff_sym, diff_age = self.grid_tracker.observe_tos_window(fg_win)
             if diff_sym and diff_age <= 3.5 and not self.grid_tracker.is_recent_own_push(diff_sym, 10.0):
-                return diff_sym, f"{diff_sym} ← TOS (typed) ✓", fg_win.hwnd, False
+                return diff_sym, f"{diff_sym} ← TOS (typed) ✓", fg_win.hwnd, False, "hit"
 
-        return "", "Hover over a TOS chart & press Alt+Q!", 0, False
+        return "", "Hover over a TOS chart & press Alt+Q!", 0, False, "miss"
+
+    def _resolve_hover_chart_ticker(
+        self,
+        job: dict,
+        wins: list[WindowInfo],
+        *,
+        for_promote_tos: bool = False,
+    ) -> tuple[str, str, int, bool]:
+        sym, det, src_hwnd, used_fb, _ = self._resolve_hover_chart_ticker_ex(
+            job, wins, for_promote_tos=for_promote_tos
+        )
+        return sym, det, src_hwnd, used_fb
 
     def _execute_job_locked(self, job: dict) -> None:
         action = job["action"]
         source = job["source"]
         extra_vks = job.get("extra_vks") or ()
+        snap = job.get("snap") or (0, "", "", "", "miss", False, "")
+        record_trace(
+            f"JOB_START action={action} src={source} kind={snap[1] or '-'} "
+            f"hwnd=0x{int(snap[0] or 0):X} cached={snap[3] or '-'} "
+            f"state={snap[4] if len(snap) >= 5 else '-'}"
+        )
 
         try:
             self.sidecar.begin_foreground_op()
@@ -2051,14 +2192,24 @@ class TickerAutomationApp:
                 extra_vks=extra_vks,
                 on_waiting=lambda: self.set_status("Release shortcut keys...", THEME["fg_warning"]),
             ):
+                record_trace(f"JOB_ABORT {action} ({source}) -> INPUT_NOT_SETTLED", level="WARN")
                 self.set_status("Release keys & retry!", THEME["fg_warning"])
                 return
 
             if action == "tos_grab":
                 wins = enum_visible_top_windows()
-                snap = job.get("snap") or (0, "", "", "")
-                if snap[1] == "tos" and (snap[3] or extract_tos_title_tickers(snap[2])):
-                    sym, det, _, _ = self._resolve_hover_chart_ticker(job, wins, for_promote_tos=False)
+                raw_s, tr_s = extract_tos_raw_title_slots(str(snap[2] or ""))
+                l_state = str(snap[4] or "miss") if len(snap) >= 5 else "miss"
+                if snap[1] == "tos" and (snap[3] or l_state == "empty" or bool(raw_s) or not tr_s):
+                    sym, det, _, _, l_state = self._resolve_hover_chart_ticker_ex(job, wins, for_promote_tos=False)
+                    if not sym and l_state == "miss" and int(job.get("fg_at_press") or 0) == int(snap[0] or 0):
+                        cal_win, _ = find_target_window(
+                            "tos", str(self.config.get("tos_window_title") or ""), self.config.get("tos_window_rect"),
+                            label="Main TOS", all_windows=wins,
+                        )
+                        sym, det, _ = grab_tos_2pass(
+                            self.config, int(snap[0] or 0), int(snap[0] or 0), self._top_hwnd, (cal_win.hwnd if cal_win else 0)
+                        )
                 else:
                     recent_h = (
                         self._last_tos_clicked_hwnd
@@ -2078,13 +2229,15 @@ class TickerAutomationApp:
                     self._record_recent_ticker(sym)
                     record_trace(f"TOS_GRAB ({source}) -> {sym}")
                 else:
+                    record_trace(f"TOS_GRAB ({source}) -> MISS ({l_state}: {det})", level="WARN")
                     self.set_status(det or "No TOS ticker grabbed", THEME["fg_warning"])
                 return
 
             if action == "hover_deep_dive":
                 wins = enum_visible_top_windows()
-                sym, det, _, _ = self._resolve_hover_chart_ticker(job, wins, for_promote_tos=False)
+                sym, det, _, _, l_state = self._resolve_hover_chart_ticker_ex(job, wins, for_promote_tos=False)
                 if not sym:
+                    record_trace(f"HOVER_DD ({source}) -> {l_state.upper()} ({det})", level="WARN")
                     self.set_status(det, THEME["fg_warning"])
                     return
                 self._stage_ticker_atomic(sym, det, wait_sync=True)
@@ -2097,8 +2250,9 @@ class TickerAutomationApp:
                 if job.get("explicit_ticker"):
                     sym = job["explicit_ticker"]
                 else:
-                    sym, det, _, _ = self._resolve_hover_chart_ticker(job, wins, for_promote_tos=True)
+                    sym, det, _, _, l_state = self._resolve_hover_chart_ticker_ex(job, wins, for_promote_tos=True)
                     if not sym:
+                        record_trace(f"PROMOTE_TOS ({source}) -> {l_state.upper()} ({det})", level="WARN")
                         self.set_status(det, THEME["fg_warning"])
                         return
                 self._stage_ticker_atomic(sym, f"Main TOS <- {sym}...", wait_sync=True)
@@ -2114,6 +2268,7 @@ class TickerAutomationApp:
 
                 res_tos = push_ticker_to_tos_main(sym, self.config, self.grid_tracker, all_windows=wins)
                 if not res_tos.ok:
+                    record_trace(f"PROMOTE_TOS '{sym}' ({source}) -> ERROR ({res_tos.message})", level="ERROR")
                     self.set_status(res_tos.message, THEME["fg_error"])
                     self._schedule_async_clipboard_finalize(sym, 0, "", 0.0, my_gen)
                     return
@@ -2627,6 +2782,7 @@ class TickerAutomationApp:
                 bm_stable = wait_for_stable_foreground(bm_hwnd, settle_ms=eff_bm_settle, max_total_ms=950)
                 if not bm_stable and not self._is_bookmap_foreground(bm_hwnd, bm_pid):
                     if skip_browser and skip_webull:
+                        record_trace(f"BM_ONLY '{ticker}' ({source}) -> FOCUS_FAILED", level="ERROR")
                         self.set_status(f"[{ticker}] Could not focus Bookmap!", THEME["fg_error"])
                         return
                 else:
@@ -2732,13 +2888,16 @@ class TickerAutomationApp:
                                 time.sleep(0.09)
                             post_enter_elapsed = time.perf_counter() - t_ent
                         else:
+                            record_trace(f"BOOKMAP '{ticker}' ({source}) -> FOCUS_LOST_CTRL_T", level="WARN")
                             self.set_status(f"[{ticker}] Bookmap focus lost during Ctrl+T", THEME["fg_warning"])
                             if skip_browser and skip_webull:
                                 return
             else:
                 if skip_browser and skip_webull:
+                    record_trace(f"BM_ONLY '{ticker}' ({source}) -> WINDOW_NOT_FOUND", level="ERROR")
                     self.set_status(f"[{ticker}] Bookmap window not found!", THEME["fg_error"])
                     return
+                record_trace(f"BOOKMAP '{ticker}' ({source}) -> NOT_FOUND_SKIP_TO_DT", level="WARN")
                 self.set_status(f"[{ticker}] Bookmap not found — jumping to DT...", THEME["fg_warning"])
 
             # Wait for Bookmap Subscribe dialog close before touching clipboard for DT!
@@ -2769,6 +2928,7 @@ class TickerAutomationApp:
             browser_hwnd = self._find_browser_hwnd(wins)
             br_was_ic = bool(browser_hwnd and user32.IsIconic(browser_hwnd))
             if not browser_hwnd or not focus_window_no_alt(browser_hwnd, max_attempts=14):
+                record_trace(f"DT_ABORT '{ticker}' ({source}) -> BROWSER_NOT_FOUND", level="ERROR")
                 self.set_status(f"[{ticker}] Browser window not found!", THEME["fg_error"])
                 self._schedule_async_clipboard_finalize(ticker, 0, "", 0.0, my_gen)
                 return
@@ -2780,6 +2940,7 @@ class TickerAutomationApp:
                 focus_window_no_alt(browser_hwnd, max_attempts=6)
                 time.sleep(0.05)
             if int(user32.GetForegroundWindow() or 0) != browser_hwnd:
+                record_trace(f"DT_ABORT '{ticker}' ({source}) -> BROWSER_FOCUS_LOST_PRE_TAB", level="ERROR")
                 self.set_status(f"[{ticker}] Browser focus lost before Ctrl+{tab_idx}!", THEME["fg_error"])
                 self._schedule_async_clipboard_finalize(ticker, 0, "", 0.0, my_gen)
                 return
@@ -2806,7 +2967,7 @@ class TickerAutomationApp:
                         send_ctrl_key_guarded("t", hold_sec=0.028, expected_hwnd=browser_hwnd)
                         time.sleep(0.14)
                     else:
-                        record_trace(f"DT_ABORT '{ticker}' -> Ctrl+{tab_idx} title={tab_title!r} missing hint {dt_hint!r}")
+                        record_trace(f"DT_ABORT '{ticker}' -> Ctrl+{tab_idx} (<non-DT browser tab>) missing hint {dt_hint!r}", level="WARN")
                         self.set_status(f"Tab Ctrl+{tab_idx} isn't DilutionTracker — aborted!", THEME["fg_error"])
                         self._schedule_async_clipboard_finalize(ticker, 0, "", 0.0, my_gen)
                         return
@@ -2827,6 +2988,7 @@ class TickerAutomationApp:
                     focus_window_no_alt(browser_hwnd, max_attempts=6)
                     time.sleep(0.04)
                 if int(user32.GetForegroundWindow() or 0) != browser_hwnd:
+                    record_trace(f"DT_ABORT '{ticker}' ({source}) -> BROWSER_FOCUS_LOST_PRE_PASTE", level="ERROR")
                     self.set_status(f"[{ticker}] Browser focus lost before URL paste!", THEME["fg_error"])
                     self._schedule_async_clipboard_finalize(ticker, 0, "", 0.0, my_gen)
                     return
@@ -2900,11 +3062,18 @@ class TickerAutomationApp:
     # --------------------------------------------------------------------------
     def on_close(self) -> None:
         self._closing = True
+        self._diag_wake.set()
         try:
             self.config["window_x"] = self.root.winfo_x()
             self.config["window_y"] = self.root.winfo_y()
             self.config["recent_tickers"] = list(self._recent_tickers[:10])
             self.save_config()
+        except Exception:
+            pass
+        try:
+            record_trace("APP_CLOSE")
+            self._write_live_diagnostics_now()
+            flush_event_log(timeout=0.5)
         except Exception:
             pass
         try:
@@ -2929,6 +3098,12 @@ class TickerAutomationApp:
 
 
 def main() -> None:
+    global _CRASH_LOG_FH
+    try:
+        _CRASH_LOG_FH = open(CRASH_LOG_PATH, "a", encoding="utf-8")
+        faulthandler.enable(file=_CRASH_LOG_FH, all_threads=True)
+    except Exception:
+        pass
     dpi_mode = enable_per_monitor_dpi_awareness()
     sys.excepthook = lambda _t, exc_val, _tb: log_error("Uncaught exception", exc_val)
     threading.excepthook = lambda args: log_error(

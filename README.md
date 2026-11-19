@@ -14,6 +14,7 @@ A lightweight, always-on-top dark-mode Windows utility (`339x109` main bar) that
 
 - **Zero-Click TOS Thumbnail Hover Deep-Dive (`Alt+Q` or Macro Key `F13`–`F24`):**
   - Hover your mouse over **any chart tile on your Thinkorswim Flexible Grid** (or detached single chart) and press **`Alt+Q`** -> instantly resolves the symbol with **zero clicks and zero keystrokes to Thinkorswim**, stages it, and launches **Bookmap + DilutionTracker** (leaving `Main@thinkorswim` untouched!).
+  - Supports clearing unused Flexible Grid slots to `0` (`0, SPRC, INHD, ...`) without losing grid alignment, with `0.05ms` slot projection and targeted header-crop OCR fallback.
 
 - **Move to Main TOS (`Alt+M` or Macro Key `F13`–`F24`):**
   - Hover a TOS thumbnail tile (or use your staged ticker when outside grids) and press **`Alt+M`** to safely push that symbol into your calibrated **`Main@thinkorswim`** symbol box (ding-free, readback-verified, zero `Ctrl+<letter>`).
@@ -31,7 +32,7 @@ A lightweight, always-on-top dark-mode Windows utility (`339x109` main bar) that
   - Fully disabled by default (**`Enable Webull Integration`** unchecked in `⚙` = zero Webull window scans or hotkeys). Turn on anytime to include Webull in Deep-Dive, hover Webull charts, or bind a dedicated Webull hotkey.
 
 - **Pure-Win32 Engine & Self-Diagnostics:**
-  - Zero `pynput`, `pyautogui`, or `pyperclip` dependencies (`psutil` only). Uses Per-Monitor DPI v2, atomic `SendInput`, OS-consuming `RegisterHotKey` with `0xE8` `MenuMaskKey`, a detached **`⚙`** settings window, Hold-Still **`🎯 Pick (1.2s)`**, and **`🔍 Copy Diagnostics`**.
+  - Zero `pynput`, `pyautogui`, or `pyperclip` dependencies (`psutil` only). Uses Per-Monitor DPI v2, atomic `SendInput`, OS-consuming `RegisterHotKey` with `0xE8` `MenuMaskKey`, a detached **`⚙`** settings window, Hold-Still **`🎯 Pick (1.2s)`**, **`🔍 Copy Diagnostics`**, and auto-captured privacy-scrubbed **`live_diagnostics.md`** + rolling **`automation_events.log`**.
 
 ---
 
