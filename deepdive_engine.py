@@ -999,7 +999,7 @@ def matches_dilution_tracker_title_ticker(title: str, ticker: str) -> bool:
     esc = re.escape(ticker)
     if re.match(rf"^{esc}(?:\s*(?:[-|•:—]|\s+Dilution)|$)", title.strip()):
         return True
-    if re.search(rf"(?:[-|•:—]\s*|DilutionTracker\s*[-|•:—]\s*){esc}(?:\s*[-|•:—]|\s*$)", title):
+    if re.search(rf"(?:[-|•:—]\s*|Dilution\s*Tracker\s*[-|•:—]\s*){esc}(?:\s*[-|•:—]|\s*$)", title):
         return True
     return False
 

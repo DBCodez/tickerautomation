@@ -1222,7 +1222,15 @@ class TickerAutomationApp:
             self._register_all_hotkeys()
             self.launch_btn.configure(text=self._launch_button_text())
             self._sync_webull_widget_states()
-            self.set_status("Settings saved ✓", THEME["fg_success"])
+            bad_hk = [
+                msg for _, (ok, msg) in self.hotkey_statuses.items()
+                if not ok and msg not in ("Off", "")
+            ]
+            if bad_hk:
+                self.set_status(f"Saved (note: {bad_hk[0]})", THEME["fg_warning"])
+            else:
+                self._close_settings_window()
+                self.set_status("Settings saved ✓", THEME["fg_success"])
         except Exception as e:
             self.set_status(f"Invalid setting: {e}", THEME["fg_error"])
 
@@ -2496,7 +2504,10 @@ class TickerAutomationApp:
             if h_m:
                 self._last_browser_hwnd = h_m[0].hwnd
                 return self._last_browser_hwnd
-        dt_m = [w for w in bwins if "dilutiontracker" in w.title.lower()]
+        dt_m = [
+            w for w in bwins
+            if "dilutiontracker" in w.title.lower() or "dilution tracker" in w.title.lower()
+        ]
         if dt_m:
             self._last_browser_hwnd = dt_m[0].hwnd
             return self._last_browser_hwnd
